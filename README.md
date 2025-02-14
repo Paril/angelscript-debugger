@@ -5,7 +5,7 @@ I wrote this framework for a project I'm working on.
 I don't have a ton of time to do support or updates, this is just here for anybody who might find any use for it and is provided as-is.
 I will be slapping any updates I do directly to this repository - there will likely not be any stable/rolling releases.
 
-![]([https://i.imgur.com/aC1Kx00.png](https://i.imgur.com/60Ep1N1.png))
+![](https://i.imgur.com/60Ep1N1.png)
 
 # What is it?
 
