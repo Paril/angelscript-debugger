@@ -237,9 +237,6 @@ public:
         ctx(ctx)
     {
         ctx->AddRef();
-
-        CacheSections();
-        CacheCallstack();
     }
     
     virtual ~asIDBCache()
@@ -263,7 +260,6 @@ public:
     //   and add any opForValue's it finds.
     virtual void QueryVariableChildren(asIDBVarMap::iterator varIt);
     
-protected:
     // add script sections; note that this must be done entirely
     // by an overridden class, and you'll have to keep track of
     // this data yourself, because AS doesn't currently provide
@@ -275,7 +271,8 @@ protected:
     // cache call stack entries, just for speed up when
     // rendering the UI.
     virtual void CacheCallstack();
-
+    
+protected:
     // get a safe view into a cached type string.
     virtual const std::string_view GetTypeNameFromType(asIDBTypeId id);
 
@@ -309,12 +306,12 @@ protected:
 
 struct asIDBBreakpoint
 {
-    const char  *section;
-    int         line;
+    std::string_view    section;
+    int                 line;
 
     constexpr bool operator==(const asIDBBreakpoint &k) const
     {
-        return line == k.line && !strcmp(section, k.section);
+        return line == k.line && section == k.section;
     }
 };
 
@@ -324,7 +321,7 @@ struct std::hash<asIDBBreakpoint>
     inline std::size_t operator()(const asIDBBreakpoint &key) const
     {
         std::size_t h = std::hash<uint8_t>()(key.line);
-        asIDBHashCombine(h, std::hash<const char *>()(key.section));
+        asIDBHashCombine(h, std::hash<std::string_view>()(key.section));
         return h;
     }
 };
@@ -360,8 +357,18 @@ public:
     asIDBDebugger() { }
     virtual ~asIDBDebugger() { }
 
+    // hooks the context onto the debugger; this will
+    // reset the cache, and unhook the previous context
+    // from the debugger. You'll want to call this if
+    // HasWork() returns true and you're requesting
+    // a new context / executing code from a context
+    // that isn't already hooked.
+    void HookContext(asIScriptContext *ctx);
+
     // break on the current context. Creates the cache
-    // and then suspends.
+    // and then suspends. Note that the cache will
+    // add a reference to this context, preventing it
+    // from being deleted until the cache is reset.
     void DebugBreak(asIScriptContext *ctx);
 
     // check if we have any work left to do.
@@ -379,6 +386,9 @@ public:
 
     // called when the debugger is being asked to resume.
     virtual void Resume() = 0;
+
+    // breakpoint stuff
+    bool ToggleBreakpoint(std::string_view section, int line);
 
 protected:
     // called when the debugger is being asked to pause.

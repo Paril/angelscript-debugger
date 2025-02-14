@@ -45,14 +45,22 @@ void asIDBImGuiFrontend::ChangeScript()
     const char *sec;
     update_row = ctx->GetLineNumber(selected_stack_entry, &col, &sec);
 
+    selected_stack_section = sec;
+
     auto file = FetchSource(func->GetModule(), sec);
     editor.SetText(file);
+    editor.AddErrorMarker(update_row - 1, "Stack Entry");
+
+    editor.SetArrow(update_row - 1, (debugger->cache->system_function.empty() && selected_stack_entry == 0) ?
+        TextEditor::LineArrow::statement : TextEditor::LineArrow::returnStatement);
+
+    for (auto &bp : debugger->breakpoints)
+        if (bp.section == selected_stack_section)
+            editor.SetBreakpoint(bp.line - 1, true);
 
     update_cursor = 2;
     resetOpenStates = true;
 }
-
-#include <set>
 
 // this is the loop for the thread.
 // return false if the UI has decided to exit.
@@ -138,6 +146,10 @@ bool asIDBImGuiFrontend::Render(bool full)
             else if (ImGui::MenuItem("Step Out"))
             {
                 debugger->StepOut();
+            }
+            else if (ImGui::MenuItem("Toggle Breakpoint"))
+            {
+                editor.SetBreakpoint(editor.GetCursorLine(), debugger->ToggleBreakpoint(selected_stack_section, editor.GetCursorLine() + 1));
             }
             ImGui::EndMainMenuBar();
         }
@@ -268,7 +280,6 @@ bool asIDBImGuiFrontend::Render(bool full)
     {
         if (!--update_cursor)
         {
-            editor.AddErrorMarker(update_row - 1, "Stack Entry");
             editor.SetCursor(update_row - 1, 0);
         }
     }
@@ -282,8 +293,34 @@ bool asIDBImGuiFrontend::Render(bool full)
         debugger->StepInto();
     else if (ImGui::IsKeyPressed(ImGuiKey::ImGuiKey_F11, false) && (mods & ImGuiKey::ImGuiMod_Shift) == ImGuiKey::ImGuiMod_Shift)
         debugger->StepOut();
+    else if (ImGui::IsKeyPressed(ImGuiKey::ImGuiKey_F9, false))
+        editor.SetBreakpoint(editor.GetCursorLine(), debugger->ToggleBreakpoint(selected_stack_section, editor.GetCursorLine() + 1));
 
     return true;
+}
+
+void asIDBImGuiFrontend::RenderVariableTable(const char *label, const char *filter, asIDBVarViewVector &vars, bool in_watch)
+{
+    if (ImGui::BeginTable(label, 3,
+        ImGuiTableFlags_BordersV | ImGuiTableFlags_BordersOuterH |
+        ImGuiTableFlags_Resizable | ImGuiTableFlags_RowBg |
+        ImGuiTableFlags_NoBordersInBody))
+    {
+        ImGui::TableSetupColumn("Name", ImGuiTableColumnFlags_WidthStretch);
+        ImGui::TableSetupColumn("Value", ImGuiTableColumnFlags_WidthStretch);
+        ImGui::TableSetupColumn("Type", ImGuiTableColumnFlags_WidthStretch);
+        ImGui::TableHeadersRow();
+            
+        for (int n = 0; n < vars.size(); n++)
+        {
+            ImGui::PushID(n);
+            auto global = vars[n];
+            RenderDebuggerVariable(global, filter, in_watch);
+            ImGui::PopID();
+        }
+
+        ImGui::EndTable();
+    }
 }
 
 void asIDBImGuiFrontend::RenderLocals(const char *filter, asIDBLocalKey stack_entry)
@@ -295,26 +332,7 @@ void asIDBImGuiFrontend::RenderLocals(const char *filter, asIDBLocalKey stack_en
 
     auto &f = cache->locals.find(stack_entry)->second;
 
-    if (ImGui::BeginTable("##Locals", 3,
-        ImGuiTableFlags_BordersV | ImGuiTableFlags_BordersOuterH |
-        ImGuiTableFlags_Resizable | ImGuiTableFlags_RowBg |
-        ImGuiTableFlags_NoBordersInBody))
-    {
-        ImGui::TableSetupColumn("Name", ImGuiTableColumnFlags_WidthStretch);
-        ImGui::TableSetupColumn("Value", ImGuiTableColumnFlags_WidthStretch);
-        ImGui::TableSetupColumn("Type", ImGuiTableColumnFlags_WidthStretch);
-        ImGui::TableHeadersRow();
-            
-        for (int n = 0; n < f.size(); n++)
-        {
-            ImGui::PushID(n);
-            auto global = f[n];
-            RenderDebuggerVariable(global, filter, false);
-            ImGui::PopID();
-        }
-
-        ImGui::EndTable();
-    }
+    RenderVariableTable("##Locals", filter, f, false);
 }
 
 void asIDBImGuiFrontend::RenderGlobals(const char *filter)
@@ -326,26 +344,7 @@ void asIDBImGuiFrontend::RenderGlobals(const char *filter)
 
     auto &f = cache->globals;
 
-    if (ImGui::BeginTable("##Globals", 3,
-        ImGuiTableFlags_BordersV | ImGuiTableFlags_BordersOuterH |
-        ImGuiTableFlags_Resizable | ImGuiTableFlags_RowBg |
-        ImGuiTableFlags_NoBordersInBody))
-    {
-        ImGui::TableSetupColumn("Name", ImGuiTableColumnFlags_WidthStretch);
-        ImGui::TableSetupColumn("Value", ImGuiTableColumnFlags_WidthStretch);
-        ImGui::TableSetupColumn("Type", ImGuiTableColumnFlags_WidthStretch);
-        ImGui::TableHeadersRow();
-            
-        for (int n = 0; n < f.size(); n++)
-        {
-            ImGui::PushID(n);
-            auto global = f[n];
-            RenderDebuggerVariable(global, filter, false);
-            ImGui::PopID();
-        }
-
-        ImGui::EndTable();
-    }
+    RenderVariableTable("##Globals", filter, f, false);
 }
 
 void asIDBImGuiFrontend::RenderWatch()
@@ -353,31 +352,12 @@ void asIDBImGuiFrontend::RenderWatch()
     asIDBCache *cache = debugger->cache.get();
     auto &f = cache->watch;
 
-    if (ImGui::BeginTable("##Globals", 3,
-        ImGuiTableFlags_BordersV | ImGuiTableFlags_BordersOuterH |
-        ImGuiTableFlags_Resizable | ImGuiTableFlags_RowBg |
-        ImGuiTableFlags_NoBordersInBody))
+    RenderVariableTable("##Globals", nullptr, f, true);
+
+    if (cache->removeFromWatch != f.end())
     {
-        ImGui::TableSetupColumn("Name", ImGuiTableColumnFlags_WidthStretch);
-        ImGui::TableSetupColumn("Value", ImGuiTableColumnFlags_WidthStretch);
-        ImGui::TableSetupColumn("Type", ImGuiTableColumnFlags_WidthStretch);
-        ImGui::TableHeadersRow();
-            
-        for (int n = 0; n < f.size(); n++)
-        {
-            ImGui::PushID(n);
-            auto global = f[n];
-            RenderDebuggerVariable(global, nullptr, true);
-            ImGui::PopID();
-        }
-
-        if (cache->removeFromWatch != f.end())
-        {
-            cache->watch.erase(cache->removeFromWatch);
-            cache->removeFromWatch = f.end();
-        }
-
-        ImGui::EndTable();
+        cache->watch.erase(cache->removeFromWatch);
+        cache->removeFromWatch = f.end();
     }
 }
 

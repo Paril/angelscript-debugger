@@ -43,6 +43,7 @@ public:
     bool Render(bool full);
 
     // window renderings
+    void RenderVariableTable(const char *label, const char *filter, asIDBVarViewVector &vars, bool in_watch);
     void RenderLocals(const char *filter, asIDBLocalKey stack_entry);
     void RenderGlobals(const char *filter);
     void RenderWatch();
@@ -57,6 +58,7 @@ protected:
 
     int selected_context = 0;
     int selected_stack_entry = 0;
+    std::string_view selected_stack_section;
     int update_cursor = 0;
     int update_row = 0;
 

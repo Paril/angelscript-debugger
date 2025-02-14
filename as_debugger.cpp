@@ -517,38 +517,60 @@ bool asIDBVarView::operator==(const asIDBVarView &other) const
 {
     // we might not have an action - functions called from within
     // the debugger will never have this set.
-    if (debugger->action == asIDBAction::None)
-        return;
+    if (debugger->action != asIDBAction::None)
+    {
+        // Step Into just breaks on whatever happens to be next.
+        if (debugger->action == asIDBAction::StepInto)
+        {
+            debugger->DebugBreak(ctx);
+            return;
+        }
+        // Step Over breaks on the next line that is <= the
+        // current stack level.
+        else if (debugger->action == asIDBAction::StepOver)
+        {
+            if (ctx->GetCallstackSize() <= debugger->stack_size)
+                debugger->DebugBreak(ctx);
+            return;
+        }
+        // Step Out breaks on the next line that is < the
+        // current stack level.
+        else if (debugger->action == asIDBAction::StepOut)
+        {
+            if (ctx->GetCallstackSize() < debugger->stack_size)
+                debugger->DebugBreak(ctx);
+            return;
+        }
+    }
 
-    // Step Into just breaks on whatever happens to be next.
-    if (debugger->action == asIDBAction::StepInto)
+    // breakpoints are handled here. note that a single
+    // breakpoint can be hit by multiple things on the same
+    // line.
+    if (!debugger->breakpoints.empty())
     {
-        debugger->DebugBreak(ctx);
-        return;
-    }
-    // Step Over breaks on the next line that is <= the
-    // current stack level.
-    else if (debugger->action == asIDBAction::StepOver)
-    {
-        if (ctx->GetCallstackSize() <= debugger->stack_size)
+        const char *section;
+        int row = ctx->GetLineNumber(0, nullptr, &section);
+
+        if (section && debugger->breakpoints.find(asIDBBreakpoint { section, row }) != debugger->breakpoints.end())
             debugger->DebugBreak(ctx);
+
         return;
     }
-    // Step Out breaks on the next line that is < the
-    // current stack level.
-    else if (debugger->action == asIDBAction::StepOut)
-    {
-        if (ctx->GetCallstackSize() < debugger->stack_size)
-            debugger->DebugBreak(ctx);
+}
+
+void asIDBDebugger::HookContext(asIScriptContext *ctx)
+{
+    if (cache && cache->ctx == ctx)
         return;
-    }
+    
+    cache = CreateCache(ctx);
+    ctx->SetLineCallback(asFUNCTION(asIDBDebugger::LineCallback), this, asCALL_CDECL);
 }
 
 void asIDBDebugger::DebugBreak(asIScriptContext *ctx)
 {
     action = asIDBAction::None;
-    cache = CreateCache(ctx);
-    ctx->SetLineCallback(asFUNCTION(asIDBDebugger::LineCallback), this, asCALL_CDECL);
+    HookContext(ctx);
     Suspend();
 }
 
@@ -578,4 +600,20 @@ void asIDBDebugger::StepOut()
     action = asIDBAction::StepOut;
     stack_size = cache->ctx->GetCallstackSize();
     Resume();
+}
+
+bool asIDBDebugger::ToggleBreakpoint(std::string_view section, int line)
+{
+    asIDBBreakpoint bp { section, line };
+
+    if (auto f = breakpoints.find(bp); f != breakpoints.end())
+    {
+        breakpoints.erase(f);
+        return false;
+    }
+    else
+    {
+        breakpoints.insert(bp);
+        return true;
+    }
 }

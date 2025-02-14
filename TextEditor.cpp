@@ -382,6 +382,19 @@ void TextEditor::renderLineNumbers() {
 				cursorScreenPos.y + i * glyphSize.y),
 				palette.get(foreground),
 				std::to_string(i + 1).c_str());
+
+            if (document[i].breakpoint) {
+                drawList->AddCircleFilled(ImVec2(ImGui::GetWindowPos().x + (fontSize * 0.5) + lineNumberMargin,
+                    (cursorScreenPos.y + i * glyphSize.y) + (fontSize * 0.5)),
+                    fontSize * 0.5, IM_COL32(255, 0, 0, 255));
+            }
+
+            if (document[i].arrow != LineArrow::none) {
+                drawList->AddText(ImVec2(ImGui::GetWindowPos().x + (fontSize * 0.25) + lineNumberMargin,
+                    cursorScreenPos.y + i * glyphSize.y - 1),
+                    (document[i].arrow == LineArrow::statement) ? palette.get(Color::currentStatement) : palette.get(Color::returnStatement),
+                    ">");
+            }
 		}
 	}
 }
@@ -1772,6 +1785,9 @@ const TextEditor::Palette& TextEditor::GetDarkPalette() {
 		IM_COL32(198,   8,  32, 255),	// matchingBracketError
 		IM_COL32(128, 128, 144, 255),	// line number
 		IM_COL32(224, 224, 240, 255),	// current line number
+        IM_COL32(255, 0,   0,   255),   // breakpoint
+        IM_COL32(255, 255, 0,   255),   // current statement
+        IM_COL32(170, 170, 255, 255),   // return statement
 	}};
 
 	return p;
@@ -1802,6 +1818,9 @@ const TextEditor::Palette& TextEditor::GetLightPalette()
 		IM_COL32(198,   8,  32, 255),	// matchingBracketError
 		IM_COL32(  0,  80,  80, 255),	// line number
 		IM_COL32(  0,   0,   0, 255),	// current line number
+        IM_COL32(255, 0,   0,   255),   // breakpoint
+        IM_COL32(255, 255, 0,   255),   // current statement
+        IM_COL32(170, 170, 255, 255),   // return statement
 	}};
 
 	return p;

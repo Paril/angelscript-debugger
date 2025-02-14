@@ -81,6 +81,7 @@ public:
 	inline bool AllCursorsHaveSelection() const { return cursors.allHaveSelection(); }
 	inline bool CurrentCursorHasSelection() const { return cursors.currentCursorHasSelection(); }
 	inline void ClearCursors() { cursors.clearAll(); }
+    inline int GetCursorLine() { return cursors.getCurrent().getSelectionStart().line; }
 
 	// clipboard actions
 	inline void Cut() { if (!readOnly) cut(); }
@@ -103,6 +104,19 @@ public:
 	void AddErrorMarker(int line, const std::string& marker);
 	void ClearErrorMarkers();
 	inline bool HasErrorMarkers() const { return errorMarkers.size() != 0; }
+
+    // arrow
+    enum class LineArrow : char {
+        none,
+        statement,
+        returnStatement
+    };
+
+    // marker stuff
+    bool HasBreakpoint(int line) { return document[line].breakpoint; }
+    LineArrow HasArrow(int line) { return document[line].arrow; }
+    void SetBreakpoint(int line, bool bp) { document[line].breakpoint = bp; }
+    void SetArrow(int line, LineArrow arrow) { document[line].arrow = arrow; }
 
 	// useful editor functions to work on selections
 	inline void IndentLines() { if (!readOnly) indentLines(); }
@@ -147,6 +161,9 @@ public:
 		matchingBracketError,
 		lineNumber,
 		currentLineNumber,
+        breakpoint,
+        currentStatement,
+        returnStatement,
 		count
 	};
 
@@ -436,6 +453,10 @@ private:
 
 		// do we need to (re)colorize this line
 		bool colorize = true;
+
+        // icons
+        bool breakpoint = false;
+        LineArrow arrow = LineArrow::none;
 	};
 
 	// the document being edited (Lines of Glyphs)
