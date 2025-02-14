@@ -81,7 +81,7 @@ public:
 	inline bool AllCursorsHaveSelection() const { return cursors.allHaveSelection(); }
 	inline bool CurrentCursorHasSelection() const { return cursors.currentCursorHasSelection(); }
 	inline void ClearCursors() { cursors.clearAll(); }
-    inline int GetCursorLine() { return cursors.getCurrent().getSelectionStart().line; }
+	inline int GetCursorLine() { return cursors.getCurrent().getSelectionStart().line; }
 
 	// clipboard actions
 	inline void Cut() { if (!readOnly) cut(); }
@@ -105,18 +105,18 @@ public:
 	void ClearErrorMarkers();
 	inline bool HasErrorMarkers() const { return errorMarkers.size() != 0; }
 
-    // arrow
-    enum class LineArrow : char {
-        none,
-        statement,
-        returnStatement
-    };
+	// arrow
+	enum class LineArrow : char {
+		none,
+		statement,
+		returnStatement
+	};
 
-    // marker stuff
-    bool HasBreakpoint(int line) { return document[line].breakpoint; }
-    LineArrow HasArrow(int line) { return document[line].arrow; }
-    void SetBreakpoint(int line, bool bp) { document[line].breakpoint = bp; }
-    void SetArrow(int line, LineArrow arrow) { document[line].arrow = arrow; }
+	// marker stuff
+	bool HasBreakpoint(int line) { return document[line].breakpoint; }
+	LineArrow HasArrow(int line) { return document[line].arrow; }
+	void SetBreakpoint(int line, bool bp) { document[line].breakpoint = bp; }
+	void SetArrow(int line, LineArrow arrow) { document[line].arrow = arrow; }
 
 	// useful editor functions to work on selections
 	inline void IndentLines() { if (!readOnly) indentLines(); }
@@ -161,9 +161,9 @@ public:
 		matchingBracketError,
 		lineNumber,
 		currentLineNumber,
-        breakpoint,
-        currentStatement,
-        returnStatement,
+		breakpoint,
+		currentStatement,
+		returnStatement,
 		count
 	};
 
@@ -454,9 +454,9 @@ private:
 		// do we need to (re)colorize this line
 		bool colorize = true;
 
-        // icons
-        bool breakpoint = false;
-        LineArrow arrow = LineArrow::none;
+		// icons
+		bool breakpoint = false;
+		LineArrow arrow = LineArrow::none;
 	};
 
 	// the document being edited (Lines of Glyphs)
@@ -544,7 +544,7 @@ private:
 	};
 
 	// a collection of actions that for a complete transaction
- 	class Transaction : public std::vector<Action> {
+	class Transaction : public std::vector<Action> {
 	public:
 		// access state before/after transactions
 		inline void setBeforeState(const Cursors& cursors) { before = cursors; }
@@ -566,7 +566,7 @@ private:
 	};
 
 	// transaction list to support do/undo/redo
- 	class Transactions : public std::vector<std::shared_ptr<Transaction>> {
+	class Transactions : public std::vector<std::shared_ptr<Transaction>> {
 	public:
 		// create a new transaction
 		static inline std::shared_ptr<Transaction> create() { return std::make_shared<Transaction>(); }
