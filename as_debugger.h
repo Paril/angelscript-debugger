@@ -23,6 +23,7 @@
 #include <string>
 #include <map>
 #include <fmt/format.h>
+#include <variant>
 #include "angelscript.h"
 
 template <class T>
@@ -268,11 +269,12 @@ public:
     // the sections it can find with functions.
     virtual void CacheSections();
 
-    // cache call stack entries, just for speed up when
-    // rendering the UI.
-    virtual void CacheCallstack();
+    // called when the debugger has broken and it needs
+    // to refresh certain cached entries.
+    virtual void Refresh();
     
 protected:
+
     // get a safe view into a cached type string.
     virtual const std::string_view GetTypeNameFromType(asIDBTypeId id);
 
@@ -302,16 +304,59 @@ protected:
 
     // adds to cache.
     virtual void EnsureSectionCached(std::string_view section);
+
+    // cache call stack entries, just for speed up when
+    // rendering the UI.
+    virtual void CacheCallstack();
 };
 
-struct asIDBBreakpoint
+struct asIDBBreakpointLocation
 {
     std::string_view    section;
     int                 line;
 
+    constexpr bool operator==(const asIDBBreakpointLocation &k) const
+    {
+        return section == k.section && line == k.line;
+    }
+};
+
+template<>
+struct std::hash<asIDBBreakpointLocation>
+{
+    inline std::size_t operator()(const asIDBBreakpointLocation &key) const
+    {
+        std::size_t h = std::hash<std::string_view>()(key.section);
+        asIDBHashCombine(h, key.line);
+        return h;
+    }
+};
+
+struct asIDBBreakpoint
+{
+private:
+    asIDBBreakpoint() = default;
+
+public:
+    std::variant<asIDBBreakpointLocation, std::string>  location;
+
+    static asIDBBreakpoint Function(std::string_view f)
+    {
+        asIDBBreakpoint bp;
+        bp.location = std::string(f);
+        return bp;
+    }
+
+    static asIDBBreakpoint FileLocation(asIDBBreakpointLocation loc)
+    {
+        asIDBBreakpoint bp;
+        bp.location = loc;
+        return bp;
+    }
+
     constexpr bool operator==(const asIDBBreakpoint &k) const
     {
-        return line == k.line && section == k.section;
+        return location == k.location;
     }
 };
 
@@ -320,8 +365,11 @@ struct std::hash<asIDBBreakpoint>
 {
     inline std::size_t operator()(const asIDBBreakpoint &key) const
     {
-        std::size_t h = std::hash<uint8_t>()(key.line);
-        asIDBHashCombine(h, std::hash<std::string_view>()(key.section));
+        std::size_t h = std::hash<uint8_t>()(key.location.index() == 0 ? 0x40000000 : 0x00000000);
+        if (key.location.index() == 0)
+            asIDBHashCombine(h, std::get<0>(key.location));
+        else
+            asIDBHashCombine(h, std::get<1>(key.location));
         return h;
     }
 };

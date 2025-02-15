@@ -55,13 +55,20 @@ void asIDBImGuiFrontend::ChangeScript()
         TextEditor::LineArrow::statement : TextEditor::LineArrow::returnStatement);
 
     for (auto &bp : debugger->breakpoints)
-        if (bp.section == selected_stack_section)
-            editor.SetBreakpoint(bp.line - 1, true);
+    {
+        if (bp.location.index() == 0)
+        {
+            auto &loc = std::get<0>(bp.location);
+            if (loc.section == selected_stack_section)
+                editor.SetBreakpoint(loc.line - 1, true);
+        }
+    }
 
     update_cursor = 2;
     resetOpenStates = true;
 }
 
+#pragma optimize("", off)
 // this is the loop for the thread.
 // return false if the UI has decided to exit.
 bool asIDBImGuiFrontend::Render(bool full)
@@ -91,6 +98,7 @@ bool asIDBImGuiFrontend::Render(bool full)
             ImGuiID dock_id_down = 0, dock_id_top = 0;
             ImGui::DockBuilderSplitNode(dockspace_id, ImGuiDir_Down, 0.20f, &dock_id_down, &dock_id_top);
             ImGui::DockBuilderDockWindow("Call Stack", dock_id_down);
+            ImGui::DockBuilderDockWindow("Breakpoints", dock_id_down);
 
             {
                 ImGuiID dock_id_left = 0, dock_id_right = 0;
@@ -175,6 +183,57 @@ bool asIDBImGuiFrontend::Render(bool full)
                     }
 
                     n++;
+                }
+            }
+        }
+        ImGui::End();
+
+        if (ImGui::Begin("Breakpoints", nullptr, ImGuiWindowFlags_HorizontalScrollbar))
+        {
+            if (full)
+            {
+                if (ImGui::BeginTable("##bp", 2,
+                    ImGuiTableFlags_BordersV | ImGuiTableFlags_BordersOuterH |
+                    ImGuiTableFlags_Resizable | ImGuiTableFlags_RowBg |
+                    ImGuiTableFlags_NoBordersInBody))
+                {
+                    ImGui::TableSetupColumn("Breakpoint", ImGuiTableColumnFlags_WidthStretch);
+                    ImGui::TableSetupColumn("Delete", ImGuiTableColumnFlags_WidthFixed);
+                    ImGui::TableHeadersRow();
+
+                    int n = 0;
+
+                    for (auto it = debugger->breakpoints.begin(); it != debugger->breakpoints.end(); )
+                    {
+                        auto &bp = *it;
+                        ImGui::PushID(n++);
+                        ImGui::TableNextRow();
+                        ImGui::TableNextColumn();
+                        if (bp.location.index() == 0)
+                        {
+                            auto &v = std::get<0>(bp.location);
+                            ImGui::Text(fmt::format("{} : {}", v.section, v.line).c_str());
+                        }
+                        else
+                            ImGui::Text(std::get<1>(bp.location).c_str());
+                        ImGui::TableNextColumn();
+                        if (ImGui::Button("X"))
+                        {
+                            if (bp.location.index() == 0)
+                            {
+                                auto &v = std::get<0>(bp.location);
+
+                                if (selected_stack_section == v.section)
+                                    editor.SetBreakpoint(v.line - 1, false);
+                            }
+                            it = debugger->breakpoints.erase(it);
+                        }
+                        else
+                            it++;
+                        ImGui::PopID();
+                    }
+
+                    ImGui::EndTable();
                 }
             }
         }
@@ -298,6 +357,7 @@ bool asIDBImGuiFrontend::Render(bool full)
 
     return true;
 }
+#pragma optimize("", on)
 
 void asIDBImGuiFrontend::RenderVariableTable(const char *label, const char *filter, asIDBVarViewVector &vars, bool in_watch)
 {

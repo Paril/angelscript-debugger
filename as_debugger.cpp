@@ -10,6 +10,11 @@ bool asIDBVarView::operator==(const asIDBVarView &other) const
     return name == other.name && type == other.type && var == other.var;
 }
 
+/*virtual*/ void asIDBCache::Refresh()
+{
+    CacheCallstack();
+}
+
 /*virtual*/ const std::string_view asIDBCache::GetTypeNameFromType(asIDBTypeId id)
 {
     if (auto f = type_names.find(id); f != type_names.end())
@@ -551,8 +556,16 @@ bool asIDBVarView::operator==(const asIDBVarView &other) const
         const char *section;
         int row = ctx->GetLineNumber(0, nullptr, &section);
 
-        if (section && debugger->breakpoints.find(asIDBBreakpoint { section, row }) != debugger->breakpoints.end())
+        if (section && debugger->breakpoints.find(asIDBBreakpoint::FileLocation(asIDBBreakpointLocation { section, row })) != debugger->breakpoints.end())
             debugger->DebugBreak(ctx);
+
+        // FIXME: this makes an std::string every time
+        auto func = ctx->GetFunction(0);
+        if (auto f = debugger->breakpoints.find(asIDBBreakpoint::Function(func->GetName())); f != debugger->breakpoints.end())
+        {
+            debugger->breakpoints.erase(f);
+            debugger->DebugBreak(ctx);
+        }
 
         return;
     }
@@ -571,6 +584,7 @@ void asIDBDebugger::DebugBreak(asIScriptContext *ctx)
 {
     action = asIDBAction::None;
     HookContext(ctx);
+    cache->Refresh();
     Suspend();
 }
 
@@ -604,7 +618,7 @@ void asIDBDebugger::StepOut()
 
 bool asIDBDebugger::ToggleBreakpoint(std::string_view section, int line)
 {
-    asIDBBreakpoint bp { section, line };
+    asIDBBreakpoint bp = asIDBBreakpoint::FileLocation({ section, line });
 
     if (auto f = breakpoints.find(bp); f != breakpoints.end())
     {

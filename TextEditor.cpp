@@ -386,7 +386,7 @@ void TextEditor::renderLineNumbers() {
 			if (document[i].breakpoint) {
 				drawList->AddCircleFilled(ImVec2(ImGui::GetWindowPos().x + (fontSize * 0.5) + lineNumberMargin,
 					(cursorScreenPos.y + i * glyphSize.y) + (fontSize * 0.5)),
-					fontSize * 0.5, IM_COL32(255, 0, 0, 255));
+					(fontSize - 2) * 0.5, palette.get(Color::breakpoint));
 			}
 
 			if (document[i].arrow != LineArrow::none) {
