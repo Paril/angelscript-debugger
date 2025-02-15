@@ -68,7 +68,6 @@ void asIDBImGuiFrontend::ChangeScript()
     resetOpenStates = true;
 }
 
-#pragma optimize("", off)
 // this is the loop for the thread.
 // return false if the UI has decided to exit.
 bool asIDBImGuiFrontend::Render(bool full)
@@ -357,7 +356,6 @@ bool asIDBImGuiFrontend::Render(bool full)
 
     return true;
 }
-#pragma optimize("", on)
 
 void asIDBImGuiFrontend::RenderVariableTable(const char *label, const char *filter, asIDBVarViewVector &vars, bool in_watch)
 {
