@@ -27,6 +27,40 @@ void asIDBImGuiFrontend::SetupImGui()
 
     editor.SetReadOnlyEnabled(true);
     editor.SetLanguage(TextEditor::Language::AngelScript());
+    editor.SetLineDecorator(17.f, [this](TextEditor::Decorator &decorator) {
+        auto size = decorator.height - 1.0f;
+        auto pos = ImGui::GetCursorScreenPos();
+        auto drawlist = ImGui::GetWindowDrawList();
+
+        if (ImGui::InvisibleButton("##Toggle", ImVec2(size, size)))
+            debugger->ToggleBreakpoint(selected_stack_section, decorator.line + 1);
+
+        asIDBBreakpoint bp = asIDBBreakpoint::FileLocation({ selected_stack_section, decorator.line + 1 });
+
+        if (auto it = debugger->breakpoints.find(bp); it != debugger->breakpoints.end())
+        {
+            drawlist->AddCircleFilled(
+                ImVec2(pos.x - 1 + size * 0.5, pos.y + size * 0.5f),
+                (size - 6.0f) * 0.5f,
+                IM_COL32(255, 0, 0, 255));
+        }
+
+        if (decorator.line == update_row - 1)
+        {
+            float end = size * 0.7;
+            const ImVec2 points[] = {
+                pos,
+                ImVec2(pos.x + end, pos.y),
+                ImVec2(pos.x + size, pos.y + size * 0.5f),
+                ImVec2(pos.x + end, pos.y + size),
+                ImVec2(pos.x, pos.y + size),
+                pos
+            };
+            drawlist->AddPolyline(points, std::extent_v<decltype(points)>,
+                (debugger->cache->system_function.empty() && selected_stack_entry == 0) ? IM_COL32(255, 255, 0, 255) : IM_COL32(0, 255, 255, 255),
+                ImDrawFlags_RoundCornersAll, 1.5);
+        }
+    });
 
     ChangeScript();
 }
@@ -36,7 +70,7 @@ void asIDBImGuiFrontend::SetupImGui()
 void asIDBImGuiFrontend::ChangeScript()
 {
     editor.ClearCursors();
-    editor.ClearErrorMarkers();
+    editor.ClearMarkers();
 
     asIScriptContext *ctx = debugger->cache->ctx;
 
@@ -45,26 +79,18 @@ void asIDBImGuiFrontend::ChangeScript()
     const char *sec;
     update_row = ctx->GetLineNumber(selected_stack_entry, &col, &sec);
 
-    selected_stack_section = sec;
-
-    auto file = FetchSource(func->GetModule(), sec);
-    editor.SetText(file);
-    editor.AddErrorMarker(update_row - 1, "Stack Entry");
-
-    editor.SetArrow(update_row - 1, (debugger->cache->system_function.empty() && selected_stack_entry == 0) ?
-        TextEditor::LineArrow::statement : TextEditor::LineArrow::returnStatement);
-
-    for (auto &bp : debugger->breakpoints)
+    if (selected_stack_section != sec)
     {
-        if (bp.location.index() == 0)
-        {
-            auto &loc = std::get<0>(bp.location);
-            if (loc.section == selected_stack_section)
-                editor.SetBreakpoint(loc.line - 1, true);
-        }
+        selected_stack_section = sec;
+
+        auto file = FetchSource(func->GetModule(), sec);
+        editor.SetText(file);
     }
 
-    update_cursor = 2;
+    editor.SetCursor(update_row - 1, 0);
+    editor.ScrollToLine(update_row - 1, TextEditor::Scroll::alignMiddle);
+    editor.AddMarker(update_row - 1, 0, IM_COL32(127, 127, 0, 127), "", "");
+
     resetOpenStates = true;
 }
 
@@ -136,6 +162,9 @@ bool asIDBImGuiFrontend::Render(bool full)
 
     if (show)
     {
+        if (!full)
+            ImGui::PushItemFlag(ImGuiItemFlags_Disabled, true);
+
         if (ImGui::BeginMainMenuBar())
         {
             if (ImGui::MenuItem("Continue"))
@@ -156,7 +185,9 @@ bool asIDBImGuiFrontend::Render(bool full)
             }
             else if (ImGui::MenuItem("Toggle Breakpoint"))
             {
-                editor.SetBreakpoint(editor.GetCursorLine(), debugger->ToggleBreakpoint(selected_stack_section, editor.GetCursorLine() + 1));
+                int line, col;
+                editor.GetMainCursor(line, col);
+                debugger->ToggleBreakpoint(selected_stack_section, line + 1);
             }
             ImGui::EndMainMenuBar();
         }
@@ -166,162 +197,131 @@ bool asIDBImGuiFrontend::Render(bool full)
 
         if (ImGui::Begin("Call Stack", nullptr, ImGuiWindowFlags_HorizontalScrollbar))
         {
-            if (full)
+            if (!cache->system_function.empty())
+                ImGui::Selectable(cache->system_function.c_str(), false, ImGuiSelectableFlags_Disabled);
+
+            int n = 0;
+            for (auto &stack : cache->call_stack)
             {
-                if (!cache->system_function.empty())
-                    ImGui::Selectable(cache->system_function.c_str(), false, ImGuiSelectableFlags_Disabled);
-
-                int n = 0;
-                for (auto &stack : cache->call_stack)
+                bool sel = selected_stack_entry == n;
+                if (ImGui::Selectable(stack.declaration.c_str(), &sel))
                 {
-                    bool sel = selected_stack_entry == n;
-                    if (ImGui::Selectable(stack.declaration.c_str(), &sel))
-                    {
-                        selected_stack_entry = n;
-                        resetText = true;
-                    }
-
-                    n++;
+                    selected_stack_entry = n;
+                    resetText = true;
                 }
+
+                n++;
             }
         }
         ImGui::End();
+
+        if (!full)
+            ImGui::PopItemFlag();
 
         if (ImGui::Begin("Breakpoints", nullptr, ImGuiWindowFlags_HorizontalScrollbar))
         {
-            if (full)
+            if (ImGui::BeginTable("##bp", 2,
+                ImGuiTableFlags_BordersV | ImGuiTableFlags_BordersOuterH |
+                ImGuiTableFlags_Resizable | ImGuiTableFlags_RowBg |
+                ImGuiTableFlags_NoBordersInBody))
             {
-                if (ImGui::BeginTable("##bp", 2,
-                    ImGuiTableFlags_BordersV | ImGuiTableFlags_BordersOuterH |
-                    ImGuiTableFlags_Resizable | ImGuiTableFlags_RowBg |
-                    ImGuiTableFlags_NoBordersInBody))
+                ImGui::TableSetupColumn("Breakpoint", ImGuiTableColumnFlags_WidthStretch);
+                ImGui::TableSetupColumn("Delete", ImGuiTableColumnFlags_WidthFixed);
+                ImGui::TableHeadersRow();
+
+                int n = 0;
+
+                for (auto it = debugger->breakpoints.begin(); it != debugger->breakpoints.end(); )
                 {
-                    ImGui::TableSetupColumn("Breakpoint", ImGuiTableColumnFlags_WidthStretch);
-                    ImGui::TableSetupColumn("Delete", ImGuiTableColumnFlags_WidthFixed);
-                    ImGui::TableHeadersRow();
-
-                    int n = 0;
-
-                    for (auto it = debugger->breakpoints.begin(); it != debugger->breakpoints.end(); )
+                    auto &bp = *it;
+                    ImGui::PushID(n++);
+                    ImGui::TableNextRow();
+                    ImGui::TableNextColumn();
+                    if (bp.location.index() == 0)
                     {
-                        auto &bp = *it;
-                        ImGui::PushID(n++);
-                        ImGui::TableNextRow();
-                        ImGui::TableNextColumn();
-                        if (bp.location.index() == 0)
-                        {
-                            auto &v = std::get<0>(bp.location);
-                            ImGui::Text(fmt::format("{} : {}", v.section, v.line).c_str());
-                        }
-                        else
-                            ImGui::Text(std::get<1>(bp.location).c_str());
-                        ImGui::TableNextColumn();
-                        if (ImGui::Button("X"))
-                        {
-                            if (bp.location.index() == 0)
-                            {
-                                auto &v = std::get<0>(bp.location);
-
-                                if (selected_stack_section == v.section)
-                                    editor.SetBreakpoint(v.line - 1, false);
-                            }
-                            it = debugger->breakpoints.erase(it);
-                        }
-                        else
-                            it++;
-                        ImGui::PopID();
+                        auto &v = std::get<0>(bp.location);
+                        ImGui::Text(fmt::format("{} : {}", v.section, v.line).c_str());
                     }
-
-                    ImGui::EndTable();
+                    else
+                        ImGui::Text(std::get<1>(bp.location).c_str());
+                    ImGui::TableNextColumn();
+                    if (ImGui::Button("X"))
+                        it = debugger->breakpoints.erase(it);
+                    else
+                        it++;
+                    ImGui::PopID();
                 }
+
+                ImGui::EndTable();
             }
         }
         ImGui::End();
 
+        if (!full)
+            ImGui::PushItemFlag(ImGuiItemFlags_Disabled, true);
+
         if (ImGui::Begin("Parameters"))
         {
-            if (full)
-            {
-                ImGui::PushItemWidth(-1);
+            ImGui::PushItemWidth(-1);
 
-                static char filterBuf[64] {};
-                ImGui::InputText("##Filter", filterBuf, sizeof(filterBuf));
-                RenderLocals(filterBuf, asIDBLocalKey(selected_stack_entry, asIDBLocalType::Parameter));
-                ImGui::PopItemWidth();
-            }
+            static char filterBuf[64] {};
+            ImGui::InputText("##Filter", filterBuf, sizeof(filterBuf));
+            RenderLocals(filterBuf, asIDBLocalKey(selected_stack_entry, asIDBLocalType::Parameter));
+            ImGui::PopItemWidth();
         }
         ImGui::End();
         
         if (ImGui::Begin("Locals"))
         {
-            if (full)
-            {
-                ImGui::PushItemWidth(-1);
+            ImGui::PushItemWidth(-1);
 
-                static char filterBuf[64] {};
-                ImGui::InputText("##Filter", filterBuf, sizeof(filterBuf));
-                RenderLocals(filterBuf, asIDBLocalKey(selected_stack_entry, asIDBLocalType::Variable));
-                ImGui::PopItemWidth();
-            }
+            static char filterBuf[64] {};
+            ImGui::InputText("##Filter", filterBuf, sizeof(filterBuf));
+            RenderLocals(filterBuf, asIDBLocalKey(selected_stack_entry, asIDBLocalType::Variable));
+            ImGui::PopItemWidth();
         }
         ImGui::End();
         
         if (ImGui::Begin("Temporaries"))
         {
-            if (full)
-            {
-                ImGui::PushItemWidth(-1);
+            ImGui::PushItemWidth(-1);
 
-                static char filterBuf[64] {};
-                ImGui::InputText("##Filter", filterBuf, sizeof(filterBuf));
-                RenderLocals(filterBuf, asIDBLocalKey(selected_stack_entry, asIDBLocalType::Temporary));
-                ImGui::PopItemWidth();
-            }
+            static char filterBuf[64] {};
+            ImGui::InputText("##Filter", filterBuf, sizeof(filterBuf));
+            RenderLocals(filterBuf, asIDBLocalKey(selected_stack_entry, asIDBLocalType::Temporary));
+            ImGui::PopItemWidth();
         }
         ImGui::End();
         
         if (ImGui::Begin("Globals"))
         {
-            if (full)
-            {
-                ImGui::PushItemWidth(-1);
+            ImGui::PushItemWidth(-1);
 
-                static char filterBuf[64] {};
-                ImGui::InputText("##Filter", filterBuf, sizeof(filterBuf));
-                RenderGlobals(filterBuf);
-                ImGui::PopItemWidth();
-            }
+            static char filterBuf[64] {};
+            ImGui::InputText("##Filter", filterBuf, sizeof(filterBuf));
+            RenderGlobals(filterBuf);
+            ImGui::PopItemWidth();
         }
         ImGui::End();
         
         if (ImGui::Begin("Watch"))
         {
-            if (full)
-            {
-                ImGui::PushItemWidth(-1);
-                RenderWatch();
-                ImGui::PopItemWidth();
-            }
+            ImGui::PushItemWidth(-1);
+            RenderWatch();
+            ImGui::PopItemWidth();
         }
         ImGui::End();
 
         if (ImGui::Begin("Sections", nullptr, ImGuiWindowFlags_HorizontalScrollbar))
-        {
-            if (full)
-            {
-                for (auto &section : cache->sections)
-                    ImGui::Selectable(section.second.data(), false);
-            }
-        }
+            for (auto &section : cache->sections)
+                ImGui::Selectable(section.second.data(), false);
         ImGui::End();
+
+        if (!full)
+            ImGui::PopItemFlag();
         
         if (ImGui::Begin("Source"))
-        {
-            if (full)
-            {
-                editor.Render("Source", ImVec2(-1, -1));
-            }
-        }
+            editor.Render("Source", ImVec2(-1, -1));
         ImGui::End();
     }
     
@@ -334,25 +334,26 @@ bool asIDBImGuiFrontend::Render(bool full)
 
     if (resetText)
         ChangeScript();
-    else if (update_cursor)
-    {
-        if (!--update_cursor)
-        {
-            editor.SetCursor(update_row - 1, 0);
-        }
-    }
     
     auto mods = ImGui::GetIO().KeyMods;
-    if (ImGui::IsKeyPressed(ImGuiKey::ImGuiKey_F5, false))
-        debugger->Resume();
-    else if (ImGui::IsKeyPressed(ImGuiKey::ImGuiKey_F10, false))
-        debugger->StepOver();
-    else if (ImGui::IsKeyPressed(ImGuiKey::ImGuiKey_F11, false) && (mods & ImGuiKey::ImGuiMod_Shift) == 0)
-        debugger->StepInto();
-    else if (ImGui::IsKeyPressed(ImGuiKey::ImGuiKey_F11, false) && (mods & ImGuiKey::ImGuiMod_Shift) == ImGuiKey::ImGuiMod_Shift)
-        debugger->StepOut();
-    else if (ImGui::IsKeyPressed(ImGuiKey::ImGuiKey_F9, false))
-        editor.SetBreakpoint(editor.GetCursorLine(), debugger->ToggleBreakpoint(selected_stack_section, editor.GetCursorLine() + 1));
+    if (full)
+    {
+        if (ImGui::IsKeyPressed(ImGuiKey::ImGuiKey_F5, false))
+            debugger->Resume();
+        else if (ImGui::IsKeyPressed(ImGuiKey::ImGuiKey_F10))
+            debugger->StepOver();
+        else if (ImGui::IsKeyPressed(ImGuiKey::ImGuiKey_F11) && (mods & ImGuiKey::ImGuiMod_Shift) == 0)
+            debugger->StepInto();
+        else if (ImGui::IsKeyPressed(ImGuiKey::ImGuiKey_F11) && (mods & ImGuiKey::ImGuiMod_Shift) == ImGuiKey::ImGuiMod_Shift)
+            debugger->StepOut();
+    }
+
+    if (ImGui::IsKeyPressed(ImGuiKey::ImGuiKey_F9, false))
+    {
+        int line, col;
+        editor.GetMainCursor(line, col);
+        debugger->ToggleBreakpoint(selected_stack_section, line + 1);
+    }
 
     return true;
 }
@@ -452,10 +453,11 @@ void asIDBImGuiFrontend::RenderDebuggerVariable(asIDBVarView &varView, const cha
 
     if (open)
     {
-        if (var.value.expandable == asIDBExpandType::Children)
+        if ((var.value.expandable == asIDBExpandType::Children ||
+             var.value.expandable == asIDBExpandType::Entries) && !var.queriedChildren)
         {
-            if (!var.queriedChildren)
-                cache->QueryVariableChildren(varIt);
+            cache->evaluators.Expand(*cache, varIt->first, varIt->second);
+            var.queriedChildren = true;
         }
     }
 
@@ -486,13 +488,34 @@ void asIDBImGuiFrontend::RenderDebuggerVariable(asIDBVarView &varView, const cha
                 i++;
             }
         }
-        else if (var.value.expandable == asIDBExpandType::Value)
+        else if (var.value.expandable == asIDBExpandType::Value ||
+                 var.value.expandable == asIDBExpandType::Entries)
         {
+            // FIXME: how to make this span the entire column?
+            // any samples I could find don't deal with long text.
+            // I guess we could have a separate "value viewer" tab that
+            // can be used if you click a button on an entry or something.
+            // Sort of like Watch but specifically for values.
+
             ImGui::TableNextRow();
             ImGui::TableNextColumn();
-            const std::string_view s = var.value.value;
-            ImGui::PushTextWrapPos(0);
-            ImGui::TextUnformatted(s.data(), s.data() + s.size());
+            ImGui::PushTextWrapPos(0.0f);
+
+            if (var.value.expandable == asIDBExpandType::Value)
+            {
+                const std::string_view s = var.value.value;
+                ImGui::TextUnformatted(s.data(), s.data() + s.size());
+            }
+            else
+            {
+                for (auto &entry : var.entries)
+                {
+                    ImGui::Bullet();
+                    ImGui::SameLine();
+                    ImGui::TextUnformatted(entry.value.data(), entry.value.data() + entry.value.size());
+                }
+            }
+
             ImGui::PopTextWrapPos();
         }
         ImGui::TreePop();

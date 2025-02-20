@@ -18,13 +18,11 @@
 #include <iterator>
 #include <memory>
 #include <string>
+#include <string_view>
 #include <unordered_set>
 #include <vector>
 
 #include "imgui.h"
-
-#undef max
-#undef min
 
 
 //
@@ -62,26 +60,14 @@ public:
 	inline bool IsOverwriteEnabled() const { return overwrite; }
 
 	// access text (using UTF-8 encoded strings)
-	inline void SetText(const std::string& text) { setText(text); }
+	// (see note below on cursor and scroll manipulation after setting new text)
+	inline void SetText(const std::string_view& text) { setText(text); }
 	inline std::string GetText() { return document.getText(); }
 	inline bool IsEmpty() const { return document.size() == 1 && document[0].size() == 0; }
-	inline int GetLineCount() const { return document.lines(); }
+	inline int GetLineCount() const { return document.lineCount(); }
 
 	// render the text editor in a Dear ImGui context
 	inline void Render(const char* title, const ImVec2& size=ImVec2(), bool border=false) { render(title, size, border); }
-
-	// manipulate cursors and selections (line numbers are zero-based)
-	inline void SetCursor(int line, int column) { moveTo(document.normalizeCoordinate(Coordinate(line, column)), false); }
-	inline void SelectAll() { selectAll(); }
-	inline void SelectLine(int line) { if (line >= 0 && line < document.lines()) selectLine(line); }
-	inline void SelectLines(int start, int end) { if (start >= 0 && end < document.lines() && start <= end) selectLines(start, end); }
-	inline void AddNextOccurrence() { addNextOccurrence(); }
-	inline void SelectAllOccurrences() { selectAllOccurrences(); }
-	inline bool AnyCursorHasSelection() const { return cursors.anyHasSelection(); }
-	inline bool AllCursorsHaveSelection() const { return cursors.allHaveSelection(); }
-	inline bool CurrentCursorHasSelection() const { return cursors.currentCursorHasSelection(); }
-	inline void ClearCursors() { cursors.clearAll(); }
-	inline int GetCursorLine() { return cursors.getCurrent().getSelectionStart().line; }
 
 	// clipboard actions
 	inline void Cut() { if (!readOnly) cut(); }
@@ -89,48 +75,119 @@ public:
 	inline void Paste() { if (!readOnly) paste(); }
 	inline void Undo() { if (!readOnly) undo(); }
 	inline void Redo() { if (!readOnly) redo(); }
-	inline bool CanUndo() { return !readOnly && transactions.canUndo(); };
-	inline bool CanRedo() { return !readOnly && transactions.canRedo(); };
-	inline size_t GetUndoIndex() { return transactions.getUndoIndex(); };
+	inline bool CanUndo() const { return !readOnly && transactions.canUndo(); };
+	inline bool CanRedo() const { return !readOnly && transactions.canRedo(); };
+	inline size_t GetUndoIndex() const { return transactions.getUndoIndex(); };
 
-	// find/replace support
-	inline void SelectFirstOccurrenceOf(const std::string& text, bool caseSensitive=true, bool wholeWord=false) { selectFirstOccurrenceOf(text, caseSensitive, wholeWord); }
-	inline void SelectNextOccurrenceOf(const std::string& text, bool caseSensitive=true, bool wholeWord=false) { selectNextOccurrenceOf(text, caseSensitive, wholeWord); }
-	inline void SelectAllOccurrencesOf(const std::string& text, bool caseSensitive=true, bool wholeWord=false) { selectAllOccurrencesOf(text, caseSensitive, wholeWord); }
-	inline void ReplaceTextInCurrentCursor(const std::string& text) { if (!readOnly) replaceTextInCurrentCursor(text); }
-	inline void ReplaceTextInAllCursors(const std::string& text) { if (!readOnly) replaceTextInAllCursors(text); }
+	// manipulate cursors and selections (line numbers are zero-based)
+	inline void SetCursor(int line, int column) { moveTo(document.normalizeCoordinate(Coordinate(line, column)), false); }
+	inline void SelectAll() { selectAll(); }
+	inline void SelectLine(int line) { if (line >= 0 && line < document.lineCount()) selectLine(line); }
+	inline void SelectLines(int start, int end) { if (start >= 0 && end < document.lineCount() && start <= end) selectLines(start, end); }
+	inline void AddNextOccurrence() { addNextOccurrence(); }
+	inline void SelectAllOccurrences() { selectAllOccurrences(); }
+	inline bool AnyCursorHasSelection() const { return cursors.anyHasSelection(); }
+	inline bool AllCursorsHaveSelection() const { return cursors.allHaveSelection(); }
+	inline bool CurrentCursorHasSelection() const { return cursors.currentCursorHasSelection(); }
+	inline void ClearCursors() { cursors.clearAll(); }
 
-	// access error markers (line numbers are zero-based)
-	void AddErrorMarker(int line, const std::string& marker);
-	void ClearErrorMarkers();
-	inline bool HasErrorMarkers() const { return errorMarkers.size() != 0; }
+	// get cursor positions (the meaning of main and current is explained in README.md)
+	inline size_t GetNumberOfCursors() const { return cursors.size(); }
+	inline void GetCursor(int& line, int& column, size_t cursor) const { return getCursor(line, column, cursor); }
+	inline void GetMainCursor(int& line, int& column) const { return getCursor(line, column, cursors.getMainIndex()); }
+	inline void GetCurrentCursor(int& line, int& column) const { return getCursor(line, column, cursors.getCurrentIndex()); }
 
-	// arrow
-	enum class LineArrow : char {
-		none,
-		statement,
-		returnStatement
+	// scrolling support
+	enum class Scroll {
+		alignTop,
+		alignMiddle,
+		alignBottom
 	};
 
-	// marker stuff
-	bool HasBreakpoint(int line) { return document[line].breakpoint; }
-	LineArrow HasArrow(int line) { return document[line].arrow; }
-	void SetBreakpoint(int line, bool bp) { document[line].breakpoint = bp; }
-	void SetArrow(int line, LineArrow arrow) { document[line].arrow = arrow; }
+	inline void ScrollToLine(int line, Scroll alignment) { scrollToLine(line, alignment); }
+	inline int GetFirstVisibleLine() const { return firstVisibleLine; }
+	inline int GetLastVisibleLine() const { return lastVisibleLine; }
+	inline int GetFirstVisibleColumn() const { return firstVisibleColumn; }
+	inline int GetLastVisibleColumn() const { return lastVisibleColumn; }
 
-	// useful editor functions to work on selections
+	inline float GetLineHeight() const { return glyphSize.y; }
+	inline float GetGlyphWidth() const { return glyphSize.x; }
+
+	// note on setting cursor and scrolling
+	//
+	// calling SetCursor or ScrollToLine has no effect until the next call to Render
+	// this is because we can only do layout calculations when we are in a Dear ImGui drawing context
+	// as a result, SetCursor or ScrollToLine just mark the request and let Render execute it
+	//
+	// the order of the calls is therefore important as they can interfere with each other
+	// so if you call SetText, SetCursor and/or ScrollToLine before Render, the order should be:
+	//
+	// * call SetText first as it resets the entire editor state including cursors and scrolling
+	// * then call SetCursor as it sets the cursor and requests that we make the cursor visible (i.e. scroll to it)
+	// * then call ScrollToLine to mark the exact scroll location (it cancels the possible SetCursor scroll request)
+	// * call Render to properly update the entire state
+	//
+	// this works on opening the editor as well as later
+
+	// find/replace support
+	inline void SelectFirstOccurrenceOf(const std::string_view& text, bool caseSensitive=true, bool wholeWord=false) { selectFirstOccurrenceOf(text, caseSensitive, wholeWord); }
+	inline void SelectNextOccurrenceOf(const std::string_view& text, bool caseSensitive=true, bool wholeWord=false) { selectNextOccurrenceOf(text, caseSensitive, wholeWord); }
+	inline void SelectAllOccurrencesOf(const std::string_view& text, bool caseSensitive=true, bool wholeWord=false) { selectAllOccurrencesOf(text, caseSensitive, wholeWord); }
+	inline void ReplaceTextInCurrentCursor(const std::string_view& text) { if (!readOnly) replaceTextInCurrentCursor(text); }
+	inline void ReplaceTextInAllCursors(const std::string_view& text) { if (!readOnly) replaceTextInAllCursors(text); }
+
+	inline void OpenFindReplaceWindow() { findReplaceVisible = true; focusOnFind = true; }
+	inline void SetFindButtonLabel(const std::string_view& label) { findButtonLabel = label; }
+	inline void SetFindAllButtonLabel(const std::string_view& label) { findAllButtonLabel = label; }
+	inline void SetReplaceButtonLabel(const std::string_view& label) { replaceButtonLabel = label; }
+	inline void SetReplaceAllButtonLabel(const std::string_view& label) { replaceAllButtonLabel = label; }
+	inline bool HasFindString() const { return findText.size(); }
+	inline void FindNext() { findNext(); }
+	inline void FindAll() { findAll(); }
+
+	// access markers (line numbers are zero-based)
+	inline void AddMarker(int line, ImU32 lineNumberColor, ImU32 textColor, const std::string_view& lineNumberTooltip, const std::string_view& textTooltip) { addMarker(line, lineNumberColor, textColor, lineNumberTooltip, textTooltip); }
+	inline void ClearMarkers() { clearMarkers(); }
+	inline bool HasMarkers() const { return markers.size() != 0; }
+
+	// line-based decoration
+	struct Decorator {
+		int line; // zero-based
+		float width;
+		float height;
+	};
+
+	inline void SetLineDecorator(float width, std::function<void(Decorator& decorator)> callback) {
+		decoratorWidth = width;
+		decoratorCallback = callback;
+	}
+
+	inline void ClearLineDecorator() { SetLineDecorator(0.0f, nullptr); }
+	inline bool HasLineDecorator() const { return decoratorWidth > 0.0f && decoratorCallback != nullptr; }
+
+	// setup context menu callbacks (these are called when a user right clicks line numbers or somewhere in the text)
+	// the editor sets up the popup menus, the callback has to populate them
+	inline void SetLineNumberContextMenuCallback(std::function<void(int line)> callback) { lineNumberContextMenuCallback = callback; }
+	inline void ClearLineNumberContextMenuCallback() { SetLineNumberContextMenuCallback(nullptr); }
+	inline bool HasLineNumberContextMenuCallback() const { return lineNumberContextMenuCallback != nullptr; }
+
+	inline void SetTextContextMenuCallback(std::function<void(int line, int column)> callback) { textContextMenuCallback = callback; }
+	inline void ClearTextContextMenuCallback() { SetTextContextMenuCallback(nullptr); }
+	inline bool HasTextContextMenuCallback() const { return textContextMenuCallback != nullptr; }
+
+	// useful functions to work on selections
 	inline void IndentLines() { if (!readOnly) indentLines(); }
 	inline void DeindentLines() { if (!readOnly) deindentLines(); }
 	inline void MoveUpLines() { if (!readOnly) moveUpLines(); }
 	inline void MoveDownLines() { if (!readOnly) moveDownLines(); }
 	inline void ToggleComments() { if (!readOnly && language) toggleComments(); }
-	inline void FilterSelections(std::function<std::string(std::string)> filter) { if (!readOnly) filterSelections(filter); }
+	inline void FilterSelections(std::function<std::string(std::string_view)> filter) { if (!readOnly) filterSelections(filter); }
 	inline void SelectionToLowerCase() { if (!readOnly) selectionToLowerCase(); }
 	inline void SelectionToUpperCase() { if (!readOnly) selectionToUpperCase(); }
 
-	// useful editor functions to work on entire text
+	// useful functions to work on entire text
 	inline void StripTrailingWhitespaces() { if (!readOnly) stripTrailingWhitespaces(); }
-	inline void FilterLines(std::function<std::string(std::string)> filter) { if (!readOnly) filterLines(filter); }
+	inline void FilterLines(std::function<std::string(std::string_view)> filter) { if (!readOnly) filterLines(filter); }
 	inline void TabsToSpaces() { if (!readOnly) tabsToSpaces(); }
 	inline void SpacesToTabs() { if (!readOnly) spacesToTabs(); }
 
@@ -152,8 +209,8 @@ public:
 		background,
 		cursor,
 		selection,
-		errorMarker,
 		whitespace,
+		matchingBracketBackground,
 		matchingBracketActive,
 		matchingBracketLevel1,
 		matchingBracketLevel2,
@@ -161,9 +218,6 @@ public:
 		matchingBracketError,
 		lineNumber,
 		currentLineNumber,
-		breakpoint,
-		currentStatement,
-		returnStatement,
 		count
 	};
 
@@ -172,7 +226,7 @@ public:
 		inline ImU32 get(Color color) const { return at(static_cast<size_t>(color)); }
 	};
 
-	inline void SetPalette(const Palette& palette) { paletteBase = palette; paletteAlpha = -1.0f; }
+	inline void SetPalette(const Palette& newPalette) { paletteBase = newPalette; paletteAlpha = -1.0f; }
 	inline const Palette& GetPalette() const { return paletteBase; }
 	inline static void SetDefaultPalette(const Palette& aValue) { defaultPalette = aValue; }
 	inline static Palette& GetDefaultPalette() { return defaultPalette; }
@@ -180,12 +234,25 @@ public:
 	static const Palette& GetDarkPalette();
 	static const Palette& GetLightPalette();
 
-	// iterator used in language specific tokonizers
+	// a single colored character (a glyph)
+	class Glyph {
+		public:
+			// constructors
+			Glyph() = default;
+			Glyph(ImWchar cp) : codepoint(cp) {}
+			Glyph(ImWchar cp, Color col) : codepoint(cp), color(col) {}
+
+			// properties
+			ImWchar codepoint = 0;
+			Color color = Color::text;
+		};
+
+	// iterator used in language specific tokenizers
 	class Iterator {
 	public:
 		// constructors
 		Iterator() = default;
-		Iterator(void* l, int i) : line(l), index(i) {}
+		Iterator(Glyph* g) : glyph(g) {}
 
 		using iterator_category = std::forward_iterator_tag;
 		using difference_type = std::ptrdiff_t;
@@ -193,75 +260,101 @@ public:
 		using pointer = ImWchar*;
 		using reference = ImWchar&;
 
-		reference operator*() const;
-		pointer operator->() const;
-		inline Iterator& operator++() { index++; return *this; }
-		inline Iterator operator++(int) { Iterator tmp = *this; index++; return tmp; }
-		inline int operator-(const Iterator& a) { return index - a.index; }
-		inline friend bool operator== (const Iterator& a, const Iterator& b) { return a.index == b.index; };
-		inline friend bool operator!= (const Iterator& a, const Iterator& b) { return !(a == b); };
-		inline friend bool operator< (const Iterator& a, const Iterator& b) { return a.index < b.index; };
-		inline friend bool operator<= (const Iterator& a, const Iterator& b) { return a.index <= b.index; };
-		inline friend bool operator> (const Iterator& a, const Iterator& b) { return a.index > b.index; };
-		inline friend bool operator>= (const Iterator& a, const Iterator& b) { return a.index >= b.index; };
+		inline reference operator*() const { return glyph->codepoint; }
+		inline pointer operator->() const { return &(glyph->codepoint); }
+		inline Iterator& operator++() { glyph++; return *this; }
+		inline Iterator operator++(int) { Iterator tmp = *this; glyph++; return tmp; }
+		inline size_t operator-(const Iterator& a) { return glyph - a.glyph; }
+		inline friend bool operator== (const Iterator& a, const Iterator& b) { return a.glyph == b.glyph; };
+		inline friend bool operator!= (const Iterator& a, const Iterator& b) { return !(a.glyph == b.glyph); };
+		inline friend bool operator< (const Iterator& a, const Iterator& b) { return a.glyph < b.glyph; };
+		inline friend bool operator<= (const Iterator& a, const Iterator& b) { return a.glyph <= b.glyph; };
+		inline friend bool operator> (const Iterator& a, const Iterator& b) { return a.glyph > b.glyph; };
+		inline friend bool operator>= (const Iterator& a, const Iterator& b) { return a.glyph >= b.glyph; };
 
 	private:
 		// properties
-		void* line;
-		int index;
+		Glyph* glyph;
 	};
 
 	// language support
 	class Language {
 	public:
+		// name of the language
 		std::string name;
+
+		// the character that starts a preprocessor directive (can be 0 if language doesn't have this feature)
 		ImWchar preprocess = 0;
 
+		// a character sequence that start a single line comment (can be blank if language doesn't have this feature)
 		std::string singleLineComment;
+
+		// an alternate single line comment character sequence (can be blank if language doesn't have this feature)
 		std::string singleLineCommentAlt;
+
+		// the start and end character sequence for multiline comments (can be blank language doesn't have this feature)
 		std::string commentStart;
 		std::string commentEnd;
 
+		// flags specifying whether language supports single quoted ['] and/or double quoted [""] strings
 		bool hasSingleQuotedStrings = false;
 		bool hasDoubleQuotedStrings = false;
+
+		// other character sequences that starts and ends strings (can be blank if language doesn't have this feature)
 		std::string otherStringStart;
 		std::string otherStringEnd;
+
+		// alternate character sequences that starts and ends strings (can be blank if language doesn't have this feature)
 		std::string otherStringAltStart;
 		std::string otherStringAltEnd;
+
+		// character inside string used to escape the next character (can be 0 if language doesn't have this feature)
 		ImWchar stringEscape = 0;
 
+		// set of keywords, declarations, identifiers used in the language (can be blank if language doesn't have these features)
 		std::unordered_set<std::string> keywords;
 		std::unordered_set<std::string> declarations;
 		std::unordered_set<std::string> identifiers;
+
+		// function to determine if specified character in considered punctuation
 		std::function<bool(ImWchar)> isPunctuation;
+
+		// functions to tokenize identifiers and numbers (can be nullptr if language doesn't have this feature)
+		// start and end refer to the characters being tokonized
+		// functions should return the an iterator to the character after the token
+		//		returning start means no token was found
 		std::function<Iterator(Iterator start, Iterator end)> getIdentifier;
 		std::function<Iterator(Iterator start, Iterator end)> getNumber;
 
+		// function to implement custom tokonizer
+		// if a token is found function should return the an iterator to the character after the token
+		// and set the color
 		std::function<Iterator(Iterator start, Iterator end, Color& color)> customTokenizer;
 
-		static const Language& C();
-		static const Language& Cpp();
-		static const Language& Cs();
-		static const Language& AngelScript();
-		static const Language& Lua();
-		static const Language& Python();
-		static const Language& Glsl();
-		static const Language& Hlsl();
-		static const Language& Json();
-		static const Language& Markdown();
+		// predefined language definitions
+		static const Language* C();
+		static const Language* Cpp();
+		static const Language* Cs();
+		static const Language* AngelScript();
+		static const Language* Lua();
+		static const Language* Python();
+		static const Language* Glsl();
+		static const Language* Hlsl();
+		static const Language* Json();
+		static const Language* Markdown();
 	};
 
-	inline void SetLanguage(const Language& l) { language = &l; languageChanged = true; }
-	inline const Language& GetLanguage() const { return *language; };
+	inline void SetLanguage(const Language* l) { language = l; languageChanged = true; }
+	inline const Language* GetLanguage() const { return language; };
 	inline bool HasLanguage() const { return language != nullptr; }
 	inline std::string GetLanguageName() const { return language == nullptr ? "None" : language->name; }
 
-	// support unicode codepoints
+	// support functions for unicode codepoints
 	class CodePoint {
 	public:
-		static std::string::const_iterator skipBOM(std::string::const_iterator i, std::string::const_iterator end);
-		static std::string::const_iterator read(std::string::const_iterator i, std::string::const_iterator end, ImWchar* codepoint);
-		static std::string::iterator write(std::string::iterator i, ImWchar codepoint);
+		static std::string_view::const_iterator skipBOM(std::string_view::const_iterator i, std::string_view::const_iterator end);
+		static std::string_view::const_iterator read(std::string_view::const_iterator i, std::string_view::const_iterator end, ImWchar* codepoint);
+		static size_t write(char* i, ImWchar codepoint); // must point to buffer of 4 character (returns number of characters written)
 		static bool isLetter(ImWchar codepoint);
 		static bool isNumber(ImWchar codepoint);
 		static bool isWord(ImWchar codepoint);
@@ -278,6 +371,7 @@ private:
 	//
 	// below is the private API
 	// private members (function and variables) start with a lowercase character
+	// private class names start with a lowercase character
 	//
 
 	class Coordinate {
@@ -304,7 +398,7 @@ private:
 		inline Coordinate operator -(const Coordinate& o) const { return Coordinate(line - o.line, column - o.column); }
 		inline Coordinate operator +(const Coordinate& o) const { return Coordinate(line + o.line, column + o.column); }
 
-		static Coordinate invalid() { static Coordinate invalid(-1, -1); return invalid; }
+		static inline Coordinate invalid() { static Coordinate invalid(-1, -1); return invalid; }
 		inline bool isValid() const { return line >= 0 && column >= 0; }
 
 		int line = 0;
@@ -350,8 +444,8 @@ private:
 
 	private:
 		// helper functions
-		Coordinate adjustCoordinateForInsert(Coordinate coordinate, Coordinate start, Coordinate end);
-		Coordinate adjustCoordinateForDelete(Coordinate coordinate, Coordinate start, Coordinate end);
+		Coordinate adjustCoordinateForInsert(Coordinate coordinate, Coordinate insertStart, Coordinate insertEnd);
+		Coordinate adjustCoordinateForDelete(Coordinate coordinate, Coordinate deleteStart, Coordinate deleteEnd);
 
 		// properties
 		Coordinate start{0, 0};
@@ -373,7 +467,7 @@ private:
 
 		// add a cursor to the list
 		inline void addCursor(Coordinate c) { addCursor(c, c); }
-		void addCursor(Coordinate start, Coordinate end);
+		void addCursor(Coordinate cursorStart, Coordinate cursorEnd);
 
 		// update the current cursor (the one last added)
 		inline void updateCurrentCursor(Coordinate coordinate) { at(current).update(coordinate); }
@@ -386,7 +480,7 @@ private:
 		bool allHaveSelection() const;
 		inline bool mainCursorHasSelection() const { return at(main).hasSelection(); }
 		inline bool currentCursorHasSelection() const { return at(current).hasSelection(); }
-		inline bool mainHasUpdate() const  { return at(main).isUpdated(); }
+		inline bool mainHasUpdate() const { return at(main).isUpdated(); }
 		bool anyHasUpdate() const;
 
 		// clear the selections and create the default cursor
@@ -400,7 +494,9 @@ private:
 
 		// get main/current cursor
 		inline Cursor& getMain() { return at(main); }
+		inline size_t getMainIndex() const { return main; }
 		inline Cursor& getCurrent() { return at(current); }
+		inline size_t getCurrentIndex() const { return current; }
 		inline iterator getCurrentAsIterator() { return begin() + current; }
 
 		// update cursors
@@ -416,18 +512,19 @@ private:
 		size_t current = 0;
 	} cursors;
 
-	// a single colored character (a glyph)
-	class Glyph {
+	// the list of text markers
+	class Marker {
 	public:
-		// constructors
-		Glyph() = default;
-		Glyph(ImWchar cp) : codepoint(cp) {}
-		Glyph(ImWchar cp, Color col) : codepoint(cp), color(col) {}
+		Marker(ImU32 lc, ImU32 tc, const std::string_view& lt, const std::string_view& tt) :
+			lineNumberColor(lc), textColor(tc), lineNumberTooltip(lt), textTooltip(tt) {}
 
-		// properties
-		ImWchar codepoint = 0;
-		Color color = Color::text;
+		ImU32 lineNumberColor;
+		ImU32 textColor;
+		std::string lineNumberTooltip;
+		std::string textTooltip;
 	};
+
+	std::vector<Marker> markers;
 
 	// tokenizer state
 	enum class State : char {
@@ -442,21 +539,17 @@ private:
 	// a single line in a document
 	class Line : public std::vector<Glyph> {
 	public:
-		// get number of glyphs (as an int)
-		inline int glyphs() const { return static_cast<int>(size()); }
-
 		// state at start of line
 		State state = State::inText;
 
-		// error marker
-		size_t errorMarker;
+		// marker reference (0 means no marker for this line)
+		size_t marker;
+
+		// width of this line (in visible columns)
+		int maxColumn = 0;
 
 		// do we need to (re)colorize this line
 		bool colorize = true;
-
-		// icons
-		bool breakpoint = false;
-		LineArrow arrow = LineArrow::none;
 	};
 
 	// the document being edited (Lines of Glyphs)
@@ -470,8 +563,8 @@ private:
 		inline int getTabSize() const { return tabSize; }
 
 		// manipulate document text (strings should be UTF-8 encoded)
-		void setText(const std::string& text);
-		Coordinate insertText(Coordinate start, const std::string& text);
+		void setText(const std::string_view& text);
+		Coordinate insertText(Coordinate start, const std::string_view& text);
 		void deleteText(Coordinate start, Coordinate end);
 
 		// access document text (strings are UTF-8 encoded)
@@ -480,18 +573,17 @@ private:
 		std::string getLineText(int line) const;
 
 		// get number of lines (as an int)
-		inline int lines() const { return static_cast<int>(size()); }
+		inline int lineCount() const { return static_cast<int>(size()); }
 
-		// determine maximum column for this document or just a line
-		int maxColumn() const;
-		int maxColumn(const Line& line) const;
-		inline int maxColumn(int line) const { return maxColumn(at(line)); }
+		// update maximum column numbers for this document and the specified lines
+		void updateMaximumColumn(int first, int last);
+		inline int getMaxColumn() const { return maxColumn; }
 
 		// translate visible column to line index (and visa versa)
-		int getIndex(const Line& line, int column) const;
-		inline int getIndex(Coordinate coordinate) const { return getIndex(at(coordinate.line), coordinate.column); }
-		int getColumn(const Line& line, int index) const;
-		inline int getColumn(int line, int index) const { return getColumn(at(line), index); }
+		size_t getIndex(const Line& line, int column) const;
+		inline size_t getIndex(Coordinate coordinate) const { return getIndex(at(coordinate.line), coordinate.column); }
+		int getColumn(const Line& line, size_t index) const;
+		inline int getColumn(int line, size_t index) const { return getColumn(at(line), index); }
 
 		// coordinate operations in context of document
 		Coordinate getUp(Coordinate from, int lines=1) const;
@@ -507,19 +599,20 @@ private:
 		// search in document
 		Coordinate findWordStart(Coordinate from) const;
 		Coordinate findWordEnd(Coordinate from) const;
-		bool findText(Coordinate from, const std::string& text, bool caseSensitive, bool wholeWord, Coordinate& start, Coordinate& end) const;
+		bool findText(Coordinate from, const std::string_view& text, bool caseSensitive, bool wholeWord, Coordinate& start, Coordinate& end) const;
 
 		// see if document was updated this frame (can only be called once)
 		inline bool isUpdated() { auto result = updated; updated = false; return result; }
 
 		// utility functions
 		bool isWholeWord(Coordinate start, Coordinate end) const;
-		inline bool isEndOfLine(Coordinate from) const { return getIndex(from) == at(from.line).glyphs(); }
-		inline bool isLastLine(int line) const { return line == lines() - 1; }
+		inline bool isEndOfLine(Coordinate from) const { return getIndex(from) == at(from.line).size(); }
+		inline bool isLastLine(int line) const { return line == lineCount() - 1; }
 		Coordinate normalizeCoordinate(Coordinate coordinate) const;
 
 	private:
 		int tabSize = 4;
+		int maxColumn = 0;
 		bool updated = false;
 	} document;
 
@@ -534,7 +627,7 @@ private:
 
 		// constructors
 		Action() = default;
-		Action(Type t, Coordinate s, Coordinate e, const std::string& txt) : type(t), start(s), end(e), text(txt) {}
+		Action(Type t, Coordinate s, Coordinate e, const std::string_view& txt) : type(t), start(s), end(e), text(txt) {}
 
 		// properties
 		Type type;
@@ -543,8 +636,8 @@ private:
 		std::string text;
 	};
 
-	// a collection of actions that for a complete transaction
-	class Transaction : public std::vector<Action> {
+	// a collection of actions for a complete transaction
+ 	class Transaction : public std::vector<Action> {
 	public:
 		// access state before/after transactions
 		inline void setBeforeState(const Cursors& cursors) { before = cursors; }
@@ -553,8 +646,8 @@ private:
 		inline const Cursors& getAfterState() const { return after; }
 
 		// add actions by type
-		void addInsert(Coordinate start, Coordinate end, std::string text) { emplace_back(Action::Type::insertText, start, end, text); };
-		void addDelete(Coordinate start, Coordinate end, std::string text) { emplace_back(Action::Type::deleteText, start, end, text); };
+		void addInsert(Coordinate start, Coordinate end, std::string_view text) { emplace_back(Action::Type::insertText, start, end, text); };
+		void addDelete(Coordinate start, Coordinate end, std::string_view text) { emplace_back(Action::Type::deleteText, start, end, text); };
 
 		// get number of actions
 		inline int actions() const { return static_cast<int>(size()); }
@@ -566,7 +659,7 @@ private:
 	};
 
 	// transaction list to support do/undo/redo
-	class Transactions : public std::vector<std::shared_ptr<Transaction>> {
+ 	class Transactions : public std::vector<std::shared_ptr<Transaction>> {
 	public:
 		// create a new transaction
 		static inline std::shared_ptr<Transaction> create() { return std::make_shared<Transaction>(); }
@@ -603,7 +696,7 @@ private:
 		State update(Line& line, const Language* language);
 
 		// see if string matches part of line
-		bool matches(Line::iterator start, Line::iterator end, const std::string& text);
+		bool matches(Line::iterator start, Line::iterator end, const std::string_view& text);
 
 		// set color fofr specified range of glyphs
 		inline void setColor(Line::iterator start, Line::iterator end, Color color) { while (start < end) (start++)->color = color; }
@@ -625,11 +718,14 @@ private:
 
 	class Bracketeer : public std::vector<Bracket> {
 	public:
+		// reset the bracketeer
+		void reset();
+
 		// update the list of bracket pairs in the document and colorize the relevant glyphs
 		void update(Document& document);
 
 		// manage active brackets
-		iterator getActive(Coordinate location);
+		iterator getActiveBracket(Coordinate location);
 
 	private:
 		// utility functions
@@ -646,21 +742,24 @@ private:
 		static inline ImWchar toBracketCloser(ImWchar ch) { return ch == '{' ? '}' : (ch == '[' ? ']' : (ch == '(' ? ')' : ch)); }
 		static inline ImWchar toBracketOpener(ImWchar ch) { return ch == '}' ? '{' : (ch == ']' ? '[' : (ch == ')' ? '(' : ch)); }
 
-		iterator active = end();
+		int active = -1;
 		Coordinate activeLocation = Coordinate::invalid();
 	} bracketeer;
 
 	// set the editor's text
-	void setText(const std::string& text);
+	void setText(const std::string_view& text);
 
 	// render (parts of) the text editor
 	void render(const char* title, const ImVec2& size, bool border);
 	void renderSelections();
-	void renderErrorMarkers();
+	void renderMarkers();
 	void renderMatchingBrackets();
 	void renderText();
 	void renderCursors();
+	void renderMargin();
 	void renderLineNumbers();
+	void renderDecorations();
+	void renderFindReplace(ImVec2 pos, ImVec2 available);
 
 	// keyboard and mouse interactions
 	void handleKeyboardInputs();
@@ -678,15 +777,33 @@ private:
 	void undo();
 	void redo();
 
+	// access cursor location
+	void getCursor(int& line, int& column, size_t cursor) const;
+
+	// scrolling support
+	void makeCursorVisible();
+	void scrollToLine(int line, Scroll alignment);
+
 	// find/replace support
-	void selectFirstOccurrenceOf(const std::string& text, bool caseSensitive, bool wholeWord);
-	void selectNextOccurrenceOf(const std::string& text, bool caseSensitive, bool wholeWord);
-	void selectAllOccurrencesOf(const std::string& text, bool caseSensitive, bool wholeWord);
+	void selectFirstOccurrenceOf(const std::string_view& text, bool caseSensitive, bool wholeWord);
+	void selectNextOccurrenceOf(const std::string_view& text, bool caseSensitive, bool wholeWord);
+	void selectAllOccurrencesOf(const std::string_view& text, bool caseSensitive, bool wholeWord);
 	void addNextOccurrence();
 	void selectAllOccurrences();
 
-	void replaceTextInCurrentCursor(const std::string& text);
-	void replaceTextInAllCursors(const std::string& text);
+	void replaceTextInCurrentCursor(const std::string_view& text);
+	void replaceTextInAllCursors(const std::string_view& text);
+
+	void openFindReplace();
+	void find();
+	void findNext();
+	void findAll();
+	void replace();
+	void replaceAll();
+
+	// marker support
+	void addMarker(int line, ImU32 lineNumberColor, ImU32 textColor, const std::string_view& lineNumberTooltip, const std::string_view& textTooltip);
+	void clearMarkers();
 
 	// cursor/selection functions
 	void moveUp(int lines, bool select);
@@ -717,13 +834,13 @@ private:
 	void toggleComments();
 
 	// transform selections (filter function should accept and return UTF-8 encoded strings)
-	void filterSelections(std::function<std::string(std::string)> filter);
+	void filterSelections(std::function<std::string(std::string_view)> filter);
 	void selectionToLowerCase();
 	void selectionToUpperCase();
 
 	// transform entire document (filter function should accept and return UTF-8 encoded strings)
 	void stripTrailingWhitespaces();
-	void filterLines(std::function<std::string(std::string)> filter);
+	void filterLines(std::function<std::string(std::string_view)> filter);
 	void tabsToSpaces();
 	void spacesToTabs();
 
@@ -732,10 +849,10 @@ private:
 	std::shared_ptr<Transaction> startTransaction();
 	bool endTransaction(std::shared_ptr<Transaction> transaction);
 
-	void insertTextIntoAllCursors(std::shared_ptr<Transaction> transaction, const std::string& text);
+	void insertTextIntoAllCursors(std::shared_ptr<Transaction> transaction, const std::string_view& text);
 	void deleteTextFromAllCursors(std::shared_ptr<Transaction> transaction);
 	void autoIndentAllCursors(std::shared_ptr<Transaction> transaction);
-	Coordinate insertText(std::shared_ptr<Transaction> transaction, Coordinate start, const std::string& text);
+	Coordinate insertText(std::shared_ptr<Transaction> transaction, Coordinate start, const std::string_view& text);
 	void deleteText(std::shared_ptr<Transaction> transaction, Coordinate start, Coordinate end);
 
 	// editor options
@@ -752,8 +869,10 @@ private:
 	ImFont* font;
 	float fontSize;
 	ImVec2 glyphSize;
-	float textStart;
-	int longestLine;
+	float lineNumberLeftOffset;
+	float lineNumberRightOffset;
+	float decorationOffset;
+	float textOffset;
 	float visibleHeight;
 	int visibleLines;
 	int firstVisibleLine;
@@ -764,13 +883,36 @@ private:
 	int lastVisibleColumn;
 	float cursorAnimationTimer = 0.0f;
 	bool ensureCursorIsVisible = false;
+	int scrollToLineNumber = -1;
+	Scroll scrollToAlignment = Scroll::alignMiddle;
 	bool showMatchingBracketsChanged = false;
 	bool languageChanged = false;
-	std::vector<std::string> errorMarkers;
 
-	static constexpr int leftMargin = 2;
-	static constexpr int lineNumberMargin = 2;
+	float decoratorWidth = 0.0f;
+	std::function<void(Decorator&)> decoratorCallback;
+
+	std::function<void(int line)> lineNumberContextMenuCallback;
+	std::function<void(int line, int column)> textContextMenuCallback;
+	int contextMenuLine = 0;
+	int contextMenuColumn = 0;
+
+	static constexpr int leftMargin = 1; // margins are expressed in glyphs
+	static constexpr int decorationMargin = 1;
+	static constexpr int textMargin = 2;
 	static constexpr int cursorWidth = 1;
+
+	// find and replace support
+	std::string findButtonLabel = "Find";
+	std::string findAllButtonLabel = "Find All";
+	std::string replaceButtonLabel = "Replace";
+	std::string replaceAllButtonLabel = "Replace All";
+	bool findReplaceVisible = false;
+	bool focusOnEditor = true;
+	bool focusOnFind = false;
+	std::string findText;
+	std::string replaceText;
+	bool caseSensitiveFind = false;
+	bool wholeWordFind = false;
 
 	// interaction context
 	float lastClickTime = -1.0f;

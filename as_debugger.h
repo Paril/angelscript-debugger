@@ -36,8 +36,9 @@ inline void asIDBHashCombine(size_t &seed, const T& v)
 enum class asIDBExpandType : uint8_t
 {
     None,      // no expansion
+    Value,     // expands to display value
     Children,  // expands to display children
-    Value      // expands to display value
+    Entries    // expands to display entries
 };
 
 struct asIDBTypeId
@@ -131,17 +132,28 @@ struct asIDBVarValue
     asIDBVarValue() = default;
 };
 
+using asIDBVarValueVector = std::vector<asIDBVarValue>;
+
 // a variable displayed in the debugger.
 struct asIDBVarState
 {
     asIDBVarValue value = {};
     std::unique_ptr<uint8_t[]> stackMemory; // if we're referring to a temporary value and not a handle
-                                         // we have to make a copy of the value here since it won't
-                                         // be available after the context is called (for getting
-                                         // array elements, calling property getters, etc).
+                                            // we have to make a copy of the value here since it won't
+                                            // be available after the context is called (for getting
+                                            // array elements, calling property getters, etc).
 
+    // set when either children or entries have been
+    // queried already.
     bool queriedChildren = false;
+
+    // children views; this only matters when
+    // value.expandable is asIDBExpandType::Children
     asIDBVarViewVector children;
+
+    // entries; these are special bullet points
+    // when value.expandable is asIDBExpandType::Entries
+    asIDBVarValueVector entries;
 };
 
 enum class asIDBLocalType : uint8_t
@@ -194,6 +206,85 @@ struct asIDBCallStackEntry
 
 using asIDBCallStackVector = std::vector<asIDBCallStackEntry>;
 
+class asIDBCache;
+
+// This interface handles evaluation of asIDBVarAddr's.
+// It is used when the debugger wishes to evaluate
+// the value of, or the children/entries of, a var.
+class asIDBTypeEvaluator
+{
+public:
+    // evaluate the given id into a value. this tells
+    // the debugger how to display the object.
+    virtual asIDBVarValue Evaluate(asIDBCache &, asIDBVarAddr id) const { return {}; }
+
+    // for expandable objects, this is called when the
+    // debugger requests it be expanded.
+    virtual void Expand(asIDBCache &, asIDBVarAddr id, asIDBVarState &state) const { }
+};
+
+// built-in evaluators you can extend for
+// making custom evaluators.
+
+template<typename T>
+class asIDBPrimitiveTypeEvaluator : public asIDBTypeEvaluator
+{
+public:
+    virtual asIDBVarValue Evaluate(asIDBCache &, asIDBVarAddr id) const override
+    {
+        return { fmt::format("{}", *reinterpret_cast<const T *>(id.address)), false };
+    }
+};
+
+class asIDBObjectTypeEvaluator : public asIDBTypeEvaluator
+{
+public:
+    virtual asIDBVarValue Evaluate(asIDBCache &cache, asIDBVarAddr id) const override;
+    virtual void Expand(asIDBCache &cache, asIDBVarAddr id, asIDBVarState &state) const override;
+
+protected:
+    // convenience function that queries the properties of the given
+    // address (and object, if set) of the given type.
+    void QueryVariableProperties(asIDBCache &cache, asIScriptObject *obj, const asIDBVarAddr &id, asIDBVarState &var) const;
+    
+    // convenience function that iterates the opFor* of the given
+    // address (and object, if set) of the given type. If positive,
+    // a specific index will be used.
+    void QueryVariableForEach(asIDBCache &cache, const asIDBVarAddr &id, asIDBVarState &var, int index = -1) const;
+};
+
+// This class manages `asIDBTypeEvaluator` instances
+// and handles the logic of finding the best
+// instance for the given type.
+// Type evaluation only deals with the lower bits of
+// type IDs; null/uninit is handled automatically
+// and never reaches the evaluator.
+// You can register existing IDs to replace their implementation.
+// When a type ID is not explicily registered, a static evaluator
+// will take over. Note that you must register the type ID's
+// sequence number, so remove any additional flags (asTYPEID_MASK_OBJECT | asTYPEID_MASK_SEQNBR).
+class asIDBTypeEvaluatorMap
+{
+    std::unordered_map<int, std::unique_ptr<asIDBTypeEvaluator>> evaluators;
+
+    // fetch the evaluator for the given type id. this will
+    // also modify the input so that handles become non-handles
+    // as this simplifies logic elsewhere.
+    const asIDBTypeEvaluator &GetEvaluator(class asIDBCache &, asIDBVarAddr &id) const;
+
+public:
+    // evaluate the given id into a value. this tells
+    // the debugger how to display the object.
+    asIDBVarValue Evaluate(class asIDBCache &, asIDBVarAddr id) const;
+
+    // for expandable objects, this is called when the
+    // debugger requests it be expanded.
+    void Expand(class asIDBCache &, asIDBVarAddr id, asIDBVarState &state) const;
+
+    // Register an evaluator.
+    void Register(int typeId, std::unique_ptr<asIDBTypeEvaluator> evaluator);
+};
+
 // this class holds the cached state of stuff
 // so that we're not querying things from AS
 // every frame. You should only ever make one of these
@@ -234,6 +325,9 @@ public:
     std::string system_function;
     asIDBCallStackVector call_stack;
 
+    // type evaluators
+    asIDBTypeEvaluatorMap evaluators;
+
     inline asIDBCache(asIScriptContext *ctx) :
         ctx(ctx)
     {
@@ -251,15 +345,6 @@ public:
 
     // caches all of the locals with the specified key.
     virtual void CacheLocals(asIDBLocalKey stack_entry);
-
-    // for the given var iterator, calculate the children.
-    // the default implementation does the following:
-    // - dereferences the handle, if it is one
-    // - iterates properties on the object (or script object)
-    //   and adds them to the children
-    // - if the type has an `opForBegin`, it will iterate
-    //   and add any opForValue's it finds.
-    virtual void QueryVariableChildren(asIDBVarMap::iterator varIt);
     
     // add script sections; note that this must be done entirely
     // by an overridden class, and you'll have to keep track of
@@ -270,13 +355,9 @@ public:
     virtual void CacheSections();
 
     // called when the debugger has broken and it needs
-    // to refresh certain cached entries.
+    // to refresh certain cached entries. This will only refresh
+    // the state of active entries.
     virtual void Refresh();
-    
-protected:
-
-    // get a safe view into a cached type string.
-    virtual const std::string_view GetTypeNameFromType(asIDBTypeId id);
 
     // adds the variable state for the given type, if it
     // doesn't already exist.
@@ -287,20 +368,10 @@ protected:
         return v.first;
     }
 
-    // for the given var id, return a rendered var value.
-    // the default implementation does the following:
-    // - primitives return a formatted representation
-    //   of their value.
-    // - enums return a formatted int32 (todo)
-    // - funcdefs return the function name
-    // - uninitialized values return a disabled "uninit"
-    // - any type that supports `opForBegin` will render
-    //   how many elements can be iterated with it (only
-    //   uint iterators are supported atm) and mark it as
-    //   expandable if it has > 0 elements
-    // - any type with properties will render nothing, but
-    //   mark that it is expandable
-    virtual asIDBVarValue FetchNodeValue(asIDBVarAddr id);
+    // get a safe view into a cached type string.
+    virtual const std::string_view GetTypeNameFromType(asIDBTypeId id);
+    
+protected:
 
     // adds to cache.
     virtual void EnsureSectionCached(std::string_view section);

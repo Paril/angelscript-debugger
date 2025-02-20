@@ -10,8 +10,12 @@
 //
 
 #include <cmath>
+#include <limits>
 
+#ifndef IMGUI_DEFINE_MATH_OPERATORS
 #define IMGUI_DEFINE_MATH_OPERATORS
+#endif
+
 #include "imgui.h"
 
 #include "TextEditor.h"
@@ -21,11 +25,13 @@
 //	TextEditor::setText
 //
 
-void TextEditor::setText(const std::string &text) {
-	// load text into document and reset transactions and cursors
+void TextEditor::setText(const std::string_view &text) {
+	// load text into document and reset subsystems
 	document.setText(text);
 	transactions.clear();
+	bracketeer.reset();
 	cursors.clearAll();
+	makeCursorVisible();
 }
 
 
@@ -39,26 +45,124 @@ void TextEditor::render(const char* title, const ImVec2& size, bool border) {
 		updatePalette();
 	}
 
-	// get font information and determine start of text
+	// get font information and determine horizontal offsets for line numbers, decorations and text
 	font = ImGui::GetFont();
 	fontSize = ImGui::GetFontSize();
 	glyphSize = ImVec2(font->CalcTextSizeA(fontSize, FLT_MAX, -1.0f, "#").x, ImGui::GetTextLineHeightWithSpacing() * lineSpacing);
-	textStart = leftMargin * glyphSize.x;
+	lineNumberLeftOffset = leftMargin * glyphSize.x;
 
-	// adjust text start in case line numbers are shown
 	if (showLineNumbers) {
-		int digits = static_cast<int>(std::log10(document.lines() + 1) + 1.0f);
-		textStart += glyphSize.x * (digits + lineNumberMargin);
+		int digits = static_cast<int>(std::log10(document.lineCount() + 1) + 1.0f);
+		lineNumberRightOffset = lineNumberLeftOffset + digits * glyphSize.x;
+		decorationOffset = lineNumberRightOffset + decorationMargin * glyphSize.x;
+
+	} else {
+		lineNumberRightOffset = lineNumberLeftOffset;
+		decorationOffset = lineNumberLeftOffset;
+	}
+
+	if (decoratorWidth > 0.0f) {
+		textOffset = decorationOffset + decoratorWidth + decorationMargin * glyphSize.x;
+
+	} else {
+		textOffset = decorationOffset + textMargin * glyphSize.x;
+	}
+
+	// get current position and total/visible editor size
+	auto pos = ImGui::GetCursorPos();
+	auto totalSize = ImVec2(textOffset + document.getMaxColumn() * glyphSize.x + cursorWidth, document.size() * glyphSize.y);
+	auto visibleSize = ImGui::GetContentRegionAvail();
+
+	if (size.x > 0.0f) {
+		visibleSize.x = std::min(visibleSize.x, size.x);
+
+	} else if (size.x < 0.0f) {
+		visibleSize.x = std::max(visibleSize.x + size.x, 0.0f);
+	}
+
+	if (size.y > 0.0f) {
+		visibleSize.y = std::min(visibleSize.y, size.y);
+
+	} else if (size.y < 0.0f) {
+		visibleSize.y = std::max(visibleSize.y + size.y, 0.0f);
+	}
+
+	// see if we have scrollbars
+	float scrollbarSize = ImGui::GetStyle().ScrollbarSize;
+	float verticalScrollBarSize = (totalSize.y > visibleSize.y) ? scrollbarSize : 0.0f;
+	float horizontalScrollBarSize = (totalSize.x > visibleSize.x) ? scrollbarSize : 0.0f;
+
+	// determine visible lines and columns
+	visibleWidth = visibleSize.x - textOffset - verticalScrollBarSize;
+	visibleColumns = std::max(static_cast<int>(std::ceil(visibleWidth / glyphSize.x)), 0);
+	visibleHeight = visibleSize.y - horizontalScrollBarSize;
+	visibleLines = std::max(static_cast<int>(std::ceil(visibleHeight / glyphSize.y)), 0);
+
+	// determine scrolling requirements
+	float scrollX = -1.0f;
+	float scrollY = -1.0f;
+
+	// ensure cursor is visible (if requested)
+	if (ensureCursorIsVisible) {
+		auto cursor = cursors.getCurrent().getInteractiveEnd();
+
+		if (cursor.line <= firstVisibleLine + 1) {
+			scrollY = std::max(0.0f, (cursor.line - 2.0f) * glyphSize.y);
+
+		} else if (cursor.line >= lastVisibleLine - 1) {
+			scrollY = std::max(0.0f, (cursor.line + 2.0f) * glyphSize.y - visibleHeight);
+		}
+
+		if (cursor.column <= firstVisibleColumn + 1) {
+			scrollX = std::max(0.0f, (cursor.column - 2.0f) * glyphSize.x);
+
+		} else if (cursor.column >= lastVisibleColumn - 1) {
+			scrollX = std::max(0.0f, (cursor.column + 2.0f) * glyphSize.x - visibleWidth);
+		}
+
+		ensureCursorIsVisible = false;
+	}
+
+	// scroll to specified line (if required)
+	if (scrollToLineNumber >= 0) {
+		scrollToLineNumber = std::min(scrollToLineNumber, document.lineCount());
+		scrollX = 0.0f;
+
+		switch (scrollToAlignment) {
+			case Scroll::alignTop:
+				scrollY = std::max(0.0f, static_cast<float>(scrollToLineNumber) * glyphSize.y);
+				break;
+
+			case Scroll::alignMiddle:
+				scrollY = std::max(0.0f, static_cast<float>(scrollToLineNumber - visibleLines / 2) * glyphSize.y);
+				break;
+
+			case Scroll::alignBottom:
+				scrollY = std::max(0.0f, static_cast<float>(scrollToLineNumber - (visibleLines - 1)) * glyphSize.y);
+				break;
+		}
+
+		scrollToLineNumber = -1;
 	}
 
 	// set style
 	ImGui::PushStyleColor(ImGuiCol_ChildBg, ImGui::ColorConvertU32ToFloat4(palette.get(Color::background)));
 	ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(0.0f, 0.0f));
 
+	// ensure editor has focus (if required)
+	if (focusOnEditor) {
+		ImGui::SetNextWindowFocus();
+		focusOnEditor = false;
+	}
+
+	// set scroll (if required)
+	if (scrollX >= 0.0f || scrollY >= 0.0f) {
+		ImGui::SetNextWindowScroll(ImVec2(scrollX, scrollY));
+	}
+
 	// start a new child window
 	// this must be done before we handle keyboard and mouse interactions to ensure correct ImGui context
-	int longestLine = document.maxColumn();
-	ImGui::SetNextWindowContentSize(ImVec2(textStart + longestLine * glyphSize.x + cursorWidth, document.lines() * glyphSize.y));
+	ImGui::SetNextWindowContentSize(totalSize);
 	ImGui::BeginChild(title, size, border, ImGuiWindowFlags_HorizontalScrollbar | ImGuiWindowFlags_NoNavInputs);
 
 	// handle keyboard and mouse inputs
@@ -70,88 +174,63 @@ void TextEditor::render(const char* title, const ImVec2& size, bool border) {
 		cursors.update();
 	}
 
-	// recolorize entire document (if showMatchingBrackets option or language have changed)
+	// recolorize entire document and reset brackets (if required)
 	if (showMatchingBracketsChanged || languageChanged) {
 		colorizer.updateEntireDocument(document, language);
+		bracketeer.reset();
 	}
 
-	// recolorize changed lines (if required)
+	// was document changed during this frame?
 	auto documentChanged = document.isUpdated();
 
-	if (language && documentChanged) {
-		colorizer.updateChangedLines(document, language);
-	}
+	if (language) {
+		if (documentChanged) {
+			// recolorize updated lines
+			colorizer.updateChangedLines(document, language);
+		}
 
-	// rebuild bracket list (if document or showMatchingBrackets option have changed)
-	if (language && showMatchingBrackets && (documentChanged || showMatchingBracketsChanged)) {
-		bracketeer.update(document);
+		if (showMatchingBrackets && (documentChanged || showMatchingBracketsChanged || languageChanged)) {
+			// rebuild bracket list
+			bracketeer.update(document);
+		}
 	}
 
 	// reset changed states
 	showMatchingBracketsChanged = false;
 	languageChanged = false;
 
-	// ensure cursor is visible (if requested)
-	if (ensureCursorIsVisible) {
-		auto cursor = cursors.getCurrent().getInteractiveEnd();
-
-		if (cursor.line <= firstVisibleLine) {
-			float targetScroll = std::max(0.0f, (cursor.line - 0.5f) * glyphSize.y);
-
-			if (targetScroll < ImGui::GetScrollY()) {
-				ImGui::SetScrollY(targetScroll);
-			}
-
-		} else if (cursor.line >= lastVisibleLine) {
-			float targetScroll = std::max(0.0f, (cursor.line + 1.5f) * glyphSize.y - visibleHeight);
-
-			if (targetScroll > ImGui::GetScrollY()) {
-				ImGui::SetScrollY(targetScroll);
-			}
-		}
-
-		if (cursor.column <= firstVisibleColumn) {
-			float targetScroll = std::max(0.0f, (cursor.column - 0.5f) * glyphSize.x);
-
-			if (targetScroll < ImGui::GetScrollX()) {
-				ImGui::SetScrollX(targetScroll);
-			}
-
-		} else if (cursor.column >= lastVisibleColumn) {
-			float targetScroll = std::max(0.0f, (cursor.column + 0.5f) * glyphSize.x - visibleWidth);
-
-			if (targetScroll > ImGui::GetScrollX()) {
-				ImGui::SetScrollX(targetScroll);
-			}
-		}
-
-		ensureCursorIsVisible = false;
-	}
-
 	// determine view parameters
-	float scrollbarSize = ImGui::GetStyle().ScrollbarSize;
-	visibleHeight = ImGui::GetWindowHeight() - ((longestLine >= visibleColumns) ? scrollbarSize : 0.0f);
-	visibleLines = std::max(static_cast<int>(std::ceil(visibleHeight / glyphSize.y)), 0);
+	firstVisibleColumn = std::max(static_cast<int>(std::floor(ImGui::GetScrollX() / glyphSize.x)), 0);
+	lastVisibleColumn = static_cast<int>(std::floor((ImGui::GetScrollX() + visibleWidth) / glyphSize.x));
 	firstVisibleLine = std::max(static_cast<int>(std::floor(ImGui::GetScrollY() / glyphSize.y)), 0);
-	lastVisibleLine = std::min(static_cast<int>(std::ceil((ImGui::GetScrollY() + visibleHeight) / glyphSize.y)), document.lines() - 1);
-
-	auto tabSize = document.getTabSize();
-	visibleWidth = ImGui::GetWindowWidth() - textStart - ((document.lines() >= visibleLines) ? scrollbarSize : 0.0f);
-	visibleColumns = std::max(static_cast<int>(std::ceil(visibleWidth / glyphSize.x)), 0);
-	firstVisibleColumn = (std::max(static_cast<int>(std::floor(ImGui::GetScrollX() / glyphSize.x)), 0) / tabSize) * tabSize;
-	lastVisibleColumn = ((static_cast<int>(std::ceil((ImGui::GetScrollX() + visibleWidth) / glyphSize.x)) + 1) / tabSize) * tabSize;
+	lastVisibleLine = std::min(static_cast<int>(std::floor((ImGui::GetScrollY() + visibleHeight) / glyphSize.y)), document.lineCount() - 1);
 
 	// render editor parts
 	renderSelections();
-	renderErrorMarkers();
+	renderMarkers();
 	renderMatchingBrackets();
 	renderText();
 	renderCursors();
+	renderMargin();
 	renderLineNumbers();
+	renderDecorations();
+
+	if (ImGui::BeginPopup("LineNumberContextMenu")) {
+		lineNumberContextMenuCallback(contextMenuLine);
+		ImGui::EndPopup();
+	}
+
+	if (ImGui::BeginPopup("TextContextMenu")) {
+		textContextMenuCallback(contextMenuLine, contextMenuColumn);
+		ImGui::EndPopup();
+	}
 
 	ImGui::EndChild();
 	ImGui::PopStyleVar();
 	ImGui::PopStyleColor();
+
+	// render find/replace popup
+	renderFindReplace(pos, visibleSize);
 }
 
 
@@ -174,9 +253,9 @@ void TextEditor::renderSelections() {
 				auto last = std::min(end.line, lastVisibleLine);
 
 				for (auto line = first; line <= last; line++) {
-					auto x = cursorScreenPos.x + textStart;
+					auto x = cursorScreenPos.x + textOffset;
 					auto left = x + (line == first ? start.column : 0) * glyphSize.x;
-					auto right = x + (line == last ? end.column : document.maxColumn(line)) * glyphSize.x;
+					auto right = x + (line == last ? end.column : document[line].maxColumn) * glyphSize.x;
 					auto y = cursorScreenPos.y + line * glyphSize.y;
 					drawList->AddRectFilled(ImVec2(left, y), ImVec2(right, y + glyphSize.y), palette.get(Color::selection));
 				}
@@ -187,29 +266,49 @@ void TextEditor::renderSelections() {
 
 
 //
-//	TextEditor::renderErrorMarkers
+//	TextEditor::renderMarkers
 //
 
-void TextEditor::renderErrorMarkers() {
-	if (errorMarkers.size()) {
+void TextEditor::renderMarkers() {
+	if (markers.size()) {
 		auto drawList = ImGui::GetWindowDrawList();
 		ImVec2 cursorScreenPos = ImGui::GetCursorScreenPos();
 
 		for (int line = firstVisibleLine; line <= lastVisibleLine; line++) {
-			if (document[line].errorMarker) {
-				auto left = cursorScreenPos.x + textStart;
-				auto right = left + document.maxColumn(line) * glyphSize.x;
+			if (document[line].marker) {
+				auto& marker = markers[document[line].marker - 1];
 				auto y = cursorScreenPos.y + line * glyphSize.y;
-				auto start = ImVec2(left, y);
-				auto end = ImVec2(right, y + glyphSize.y);
-				drawList->AddRectFilled(start, end, palette.get(Color::errorMarker));
 
-				if (ImGui::IsMouseHoveringRect(start, end)) {
-					ImGui::PushStyleColor(ImGuiCol_PopupBg, palette.get(Color::errorMarker));
-					ImGui::BeginTooltip();
-					ImGui::TextUnformatted(errorMarkers[document[line].errorMarker - 1].c_str());
-					ImGui::EndTooltip();
-					ImGui::PopStyleColor();
+				if (((marker.lineNumberColor >> IM_COL32_A_SHIFT) & 0xFF) != 0) {
+					auto left = cursorScreenPos.x + lineNumberLeftOffset;
+					auto right = cursorScreenPos.x + lineNumberRightOffset;
+					auto start = ImVec2(left, y);
+					auto end = ImVec2(right, y + glyphSize.y);
+					drawList->AddRectFilled(start, end, marker.lineNumberColor);
+
+					if (marker.lineNumberTooltip.size() && ImGui::IsMouseHoveringRect(start, end)) {
+						ImGui::PushStyleColor(ImGuiCol_PopupBg, marker.lineNumberColor);
+						ImGui::BeginTooltip();
+						ImGui::TextUnformatted(marker.lineNumberTooltip.c_str());
+						ImGui::EndTooltip();
+						ImGui::PopStyleColor();
+					}
+				}
+
+				if (((marker.textColor >> IM_COL32_A_SHIFT) & 0xFF) != 0) {
+					auto left = cursorScreenPos.x + textOffset;
+					auto right = left + lastVisibleColumn * glyphSize.x;
+					auto start = ImVec2(left, y);
+					auto end = ImVec2(right, y + glyphSize.y);
+					drawList->AddRectFilled(start, end, marker.textColor);
+
+					if (marker.textTooltip.size() && ImGui::IsMouseHoveringRect(start, end)) {
+						ImGui::PushStyleColor(ImGuiCol_PopupBg, marker.textColor);
+						ImGui::BeginTooltip();
+						ImGui::TextUnformatted(marker.textTooltip.c_str());
+						ImGui::EndTooltip();
+						ImGui::PopStyleColor();
+					}
 				}
 			}
 		}
@@ -233,7 +332,7 @@ void TextEditor::renderMatchingBrackets() {
 					bracket.start.line <= lastVisibleLine &&
 					bracket.end.line > firstVisibleLine) {
 
-					auto lineX = cursorScreenPos.x + textStart + std::min(bracket.start.column, bracket.end.column) * glyphSize.x;
+					auto lineX = cursorScreenPos.x + textOffset + std::min(bracket.start.column, bracket.end.column) * glyphSize.x;
 					auto startY = cursorScreenPos.y + (bracket.start.line + 1) * glyphSize.y;
 					auto endY = cursorScreenPos.y + bracket.end.line * glyphSize.y;
 					drawList->AddLine(ImVec2(lineX, startY), ImVec2(lineX, endY), palette.get(Color::whitespace), 1.0f);
@@ -241,19 +340,19 @@ void TextEditor::renderMatchingBrackets() {
 			}
 
 			// render active bracket pair
-			auto active = bracketeer.getActive(cursors.getMain().getInteractiveEnd());
+			auto active = bracketeer.getActiveBracket(cursors.getMain().getInteractiveEnd());
 
 			if (active != bracketeer.end() &&
 				active->start.line <= lastVisibleLine &&
 				active->end.line > firstVisibleLine) {
 
-				auto x1 = cursorScreenPos.x + textStart + active->start.column * glyphSize.x;
+				auto x1 = cursorScreenPos.x + textOffset + active->start.column * glyphSize.x;
 				auto y1 = cursorScreenPos.y + active->start.line * glyphSize.y;
-				drawList->AddRectFilled(ImVec2(x1, y1), ImVec2(x1 + glyphSize.x, y1 + glyphSize.y), palette.get(Color::whitespace));
+				drawList->AddRectFilled(ImVec2(x1, y1), ImVec2(x1 + glyphSize.x, y1 + glyphSize.y), palette.get(Color::matchingBracketBackground));
 
-				auto x2 = cursorScreenPos.x + textStart + active->end.column * glyphSize.x;
+				auto x2 = cursorScreenPos.x + textOffset + active->end.column * glyphSize.x;
 				auto y2 = cursorScreenPos.y + active->end.line * glyphSize.y;
-				drawList->AddRectFilled(ImVec2(x2, y2), ImVec2(x2 + glyphSize.x, y2 + glyphSize.y), palette.get(Color::whitespace));
+				drawList->AddRectFilled(ImVec2(x2, y2), ImVec2(x2 + glyphSize.x, y2 + glyphSize.y), palette.get(Color::matchingBracketBackground));
 
 				if (active->end.line - active->start.line > 1) {
 					auto lineX = std::min(x1, x2);
@@ -272,18 +371,19 @@ void TextEditor::renderMatchingBrackets() {
 void TextEditor::renderText() {
 	auto drawList = ImGui::GetWindowDrawList();
 	ImVec2 cursorScreenPos = ImGui::GetCursorScreenPos();
-	ImVec2 lineScreenPos = cursorScreenPos + ImVec2(textStart, firstVisibleLine * glyphSize.y);
+	ImVec2 lineScreenPos = cursorScreenPos + ImVec2(textOffset, firstVisibleLine * glyphSize.y);
 	auto tabSize = document.getTabSize();
+	auto firstRenderableColumn = (firstVisibleColumn / tabSize) * tabSize;
 
 	for (int i = firstVisibleLine; i <= lastVisibleLine; i++) {
 		auto& line = document[i];
 
 		// draw colored glyphs for current line
-		auto column = firstVisibleColumn;
+		auto column = firstRenderableColumn;
 		auto index = document.getIndex(line, column);
-		auto glyphs = line.glyphs();
+		auto lineSize = line.size();
 
-		while (index < glyphs && column <= lastVisibleColumn) {
+		while (index < lineSize && column <= lastVisibleColumn) {
 			auto& glyph = line[index];
 			auto codepoint = glyph.codepoint;
 			ImVec2 glyphPos{lineScreenPos.x + column * glyphSize.x, lineScreenPos.y};
@@ -333,18 +433,53 @@ void TextEditor::renderCursors() {
 	// update cursor animation timer
 	cursorAnimationTimer = std::fmod(cursorAnimationTimer + ImGui::GetIO().DeltaTime, 1.0f);
 
-	if (ImGui::IsWindowFocused() && (!ImGui::GetIO().ConfigInputTextCursorBlink || cursorAnimationTimer < 0.5f)) {
-		auto drawList = ImGui::GetWindowDrawList();
+	if (ImGui::IsWindowFocused()) {
 		ImVec2 cursorScreenPos = ImGui::GetCursorScreenPos();
 
-		for (auto& cursor : cursors) {
-			auto pos = cursor.getInteractiveEnd();
+		if (!ImGui::GetIO().ConfigInputTextCursorBlink || cursorAnimationTimer < 0.5f) {
+			auto drawList = ImGui::GetWindowDrawList();
 
-			if (pos.line >= firstVisibleLine && pos.line <= lastVisibleLine) {
-				auto x = cursorScreenPos.x + textStart + pos.column * glyphSize.x - 1;
-				auto y = cursorScreenPos.y + pos.line * glyphSize.y;
-				drawList->AddRectFilled(ImVec2(x, y), ImVec2(x + cursorWidth, y + glyphSize.y), palette.get(Color::cursor));
+			for (auto& cursor : cursors) {
+				auto pos = cursor.getInteractiveEnd();
+
+				if (pos.line >= firstVisibleLine && pos.line <= lastVisibleLine) {
+					auto x = cursorScreenPos.x + textOffset + pos.column * glyphSize.x - 1;
+					auto y = cursorScreenPos.y + pos.line * glyphSize.y;
+					drawList->AddRectFilled(ImVec2(x, y), ImVec2(x + cursorWidth, y + glyphSize.y), palette.get(Color::cursor));
+				}
 			}
+		}
+
+		// notify OS of text input position for advanced Input Method Editor (IME)
+		// this is very hackish but required for SDL3 backend as it will not report
+		// text input events unless we do this
+		if (!readOnly && ImGui::GetPlatformIO().Platform_SetImeDataFn) {
+			auto pos = cursors.getCurrent().getInteractiveEnd();
+			auto x = cursorScreenPos.x + textOffset + pos.column * glyphSize.x - 1;
+			auto y = cursorScreenPos.y + pos.line * glyphSize.y;
+
+			ImGuiPlatformImeData data;
+			data.WantVisible = true;
+			data.InputPos = ImVec2(x, y);
+			data.InputLineHeight = glyphSize.y;
+			ImGui::GetPlatformIO().Platform_SetImeDataFn(ImGui::GetIO().Ctx, ImGui::GetMainViewport(), &data);
+		}
+	}
+}
+
+
+//
+//	TextEditor::renderMargin
+//
+
+void TextEditor::renderMargin() {
+	if ((decoratorWidth > 0.0f && decoratorCallback) || showLineNumbers) {
+		// erase background in case we are scrolling horizontally
+		if (ImGui::GetScrollX() > 0.0f) {
+			ImGui::GetWindowDrawList()->AddRectFilled(
+				ImGui::GetWindowPos(),
+				ImGui::GetWindowPos() + ImVec2(textOffset, ImGui::GetWindowSize().y),
+				palette.get(Color::background));
 		}
 	}
 }
@@ -357,45 +492,225 @@ void TextEditor::renderCursors() {
 void TextEditor::renderLineNumbers() {
 	if (showLineNumbers) {
 		auto drawList = ImGui::GetWindowDrawList();
-		ImVec2 cursorScreenPos = ImGui::GetCursorScreenPos();
-		auto lineNumberEnd = ImGui::GetWindowPos().x + textStart;
-
-		// erase background in case we are scrolling horizontally
-		if (ImGui::GetScrollX() > 0.0f) {
-			drawList->AddRectFilled(
-				ImGui::GetWindowPos(),
-				ImGui::GetWindowPos() + ImVec2(textStart,
-				ImGui::GetWindowSize().y),
-				palette.get(Color::background));
-		}
-
-		// get the line number of the last cursor
+		auto cursorScreenPos = ImGui::GetCursorScreenPos();
 		auto curserLine = cursors.getCurrent().getInteractiveEnd().line;
+		auto position = ImVec2(ImGui::GetWindowPos().x + lineNumberRightOffset, cursorScreenPos.y);
 
 		for (int i = firstVisibleLine; i <= lastVisibleLine; i++) {
-			int digits = static_cast<int>(std::log10(i + 1) + 1.0f);
-			auto lineNumberWidth = (digits + lineNumberMargin) * glyphSize.x;
-			Color foreground =  i == curserLine ? Color::currentLineNumber : Color::lineNumber;
+			auto width = static_cast<int>(std::log10(i + 1) + 1.0f) * glyphSize.x;
+			auto foreground = (i == curserLine) ? Color::currentLineNumber : Color::lineNumber;
+			auto number = std::to_string(i + 1);
+			drawList->AddText(position + ImVec2(-width, i * glyphSize.y), palette.get(foreground), number.c_str());
+		}
+	}
+}
 
-			drawList->AddText(
-				ImVec2(lineNumberEnd - lineNumberWidth,
-				cursorScreenPos.y + i * glyphSize.y),
-				palette.get(foreground),
-				std::to_string(i + 1).c_str());
 
-			if (document[i].breakpoint) {
-				drawList->AddCircleFilled(ImVec2(ImGui::GetWindowPos().x + (fontSize * 0.5) + lineNumberMargin,
-					(cursorScreenPos.y + i * glyphSize.y) + (fontSize * 0.5)),
-					(fontSize - 2) * 0.5, palette.get(Color::breakpoint));
-			}
+//
+//	TextEditor::renderDecorations
+//
 
-			if (document[i].arrow != LineArrow::none) {
-				drawList->AddText(ImVec2(ImGui::GetWindowPos().x + (fontSize * 0.25) + lineNumberMargin,
-					cursorScreenPos.y + i * glyphSize.y - 1),
-					(document[i].arrow == LineArrow::statement) ? palette.get(Color::currentStatement) : palette.get(Color::returnStatement),
-					">");
+void TextEditor::renderDecorations() {
+	if (decoratorWidth > 0.0f && decoratorCallback) {
+		auto cursorScreenPos = ImGui::GetCursorScreenPos();
+		auto position = ImVec2(ImGui::GetWindowPos().x + decorationOffset, cursorScreenPos.y + glyphSize.y * firstVisibleLine);
+		Decorator decorator{0, decoratorWidth, glyphSize.y};
+
+		for (int i = firstVisibleLine; i <= lastVisibleLine; i++) {
+			decorator.line = i;
+			ImGui::SetCursorScreenPos(position);
+			ImGui::PushID(i);
+			decoratorCallback(decorator);
+			ImGui::PopID();
+			position.y += glyphSize.y;
+		}
+
+		ImGui::SetCursorScreenPos(cursorScreenPos);
+	}
+}
+
+
+//
+//	latchButton
+//
+
+static bool latchButton(const char* label, bool* value, const ImVec2& size) {
+	bool changed = false;
+	ImVec4* colors = ImGui::GetStyle().Colors;
+
+	if (*value) {
+		ImGui::PushStyleColor(ImGuiCol_Button, colors[ImGuiCol_ButtonActive]);
+		ImGui::PushStyleColor(ImGuiCol_ButtonHovered, colors[ImGuiCol_ButtonActive]);
+		ImGui::PushStyleColor(ImGuiCol_ButtonActive, colors[ImGuiCol_TableBorderLight]);
+
+	} else {
+		ImGui::PushStyleColor(ImGuiCol_Button, colors[ImGuiCol_TableBorderLight]);
+		ImGui::PushStyleColor(ImGuiCol_ButtonHovered, colors[ImGuiCol_TableBorderLight]);
+		ImGui::PushStyleColor(ImGuiCol_ButtonActive, colors[ImGuiCol_ButtonActive]);
+	}
+
+	ImGui::Button(label, size);
+
+	if (ImGui::IsItemClicked(ImGuiMouseButton_Left)) {
+		*value = !*value;
+		changed = true;
+	}
+
+	ImGui::PopStyleColor(3);
+	return changed;
+}
+
+
+//
+//	inputString
+//
+
+static bool inputString(const char* label, std::string* value, ImGuiInputTextFlags flags=ImGuiInputTextFlags_None) {
+	flags |=
+		ImGuiInputTextFlags_NoUndoRedo |
+		ImGuiInputTextFlags_CallbackResize;
+
+	return ImGui::InputText(label, (char*) value->c_str(), value->capacity() + 1, flags, [](ImGuiInputTextCallbackData* data) {
+		if (data->EventFlag == ImGuiInputTextFlags_CallbackResize) {
+			std::string* value = (std::string*) data->UserData;
+			value->resize(data->BufTextLen);
+			data->Buf = (char*) value->c_str();
+		}
+
+		return 0;
+	}, value);
+}
+
+
+//
+//	TextEditor::renderFindReplace
+//
+
+void TextEditor::renderFindReplace(ImVec2 pos, ImVec2 contentSize) {
+	// render find/replace window (if required)
+	if (findReplaceVisible) {
+		// calculate sizes
+		auto& style = ImGui::GetStyle();
+		auto fieldWidth = 250.0f;
+
+		auto button1Width = ImGui::CalcTextSize(findButtonLabel.c_str()).x + style.ItemSpacing.x * 2.0f;
+		auto button2Width = ImGui::CalcTextSize(findAllButtonLabel.c_str()).x + style.ItemSpacing.x * 2.0f;
+		auto optionWidth = ImGui::CalcTextSize("Aa").x + style.ItemSpacing.x * 2.0f;
+
+		if (!readOnly) {
+			button1Width = std::max(button1Width, ImGui::CalcTextSize(replaceButtonLabel.c_str()).x + style.ItemSpacing.x * 2.0f);
+			button2Width = std::max(button2Width, ImGui::CalcTextSize(replaceAllButtonLabel.c_str()).x + style.ItemSpacing.x * 2.0f);
+		}
+
+		auto windowHeight =
+			style.ChildBorderSize * 2.0f +
+			style.WindowPadding.y * 2.0f +
+			ImGui::GetFrameHeight() +
+			(readOnly ? 0.0f : (style.ItemSpacing.y + ImGui::GetFrameHeight()));
+
+		auto windowWidth =
+			style.ChildBorderSize * 2.0f +
+			style.WindowPadding.x * 2.0f +
+			fieldWidth + style.ItemSpacing.x +
+			button1Width + style.ItemSpacing.x +
+			button2Width + style.ItemSpacing.x +
+			optionWidth * 3.0f + style.ItemSpacing.x * 2.0f;
+
+		// create window
+		ImGui::SetCursorPos(ImVec2(
+			pos.x + contentSize.x - windowWidth - style.ScrollbarSize - style.ItemSpacing.x,
+			pos.y + style.ItemSpacing.y * 2.0f));
+
+		ImGui::SetNextWindowBgAlpha(0.6f);
+		ImGui::BeginChild("find-replace", ImVec2(windowWidth, windowHeight), ImGuiChildFlags_Borders);
+		ImGui::SetNextItemWidth(fieldWidth);
+
+		if (focusOnFind) {
+			ImGui::SetKeyboardFocusHere();
+			focusOnFind = false;
+		}
+
+		if (inputString("###find", &findText, ImGuiInputTextFlags_AutoSelectAll)) {
+			if (findText.size()) {
+				selectFirstOccurrenceOf(findText, caseSensitiveFind, wholeWordFind);
+
+			} else {
+				cursors.clearAll();
 			}
 		}
+
+		if (ImGui::IsItemDeactivated() && (ImGui::IsKeyPressed(ImGuiKey_Enter) || ImGui::IsKeyPressed(ImGuiKey_KeypadEnter))){
+			focusOnEditor = true;
+		}
+
+		bool disableFindButtons = !findText.size();
+
+		if (disableFindButtons) {
+			ImGui::BeginDisabled();
+		}
+
+		ImGui::SameLine();
+
+		if (ImGui::Button(findButtonLabel.c_str(), ImVec2(button1Width, 0.0f))) {
+			find();
+		}
+
+		ImGui::SameLine();
+
+		if (ImGui::Button(findAllButtonLabel.c_str(), ImVec2(button2Width, 0.0f))) {
+			findAll();
+		}
+
+		if (disableFindButtons) {
+			ImGui::EndDisabled();
+		}
+
+		ImGui::SameLine();
+
+		if (latchButton("Aa", &caseSensitiveFind, ImVec2(optionWidth, 0.0f))) {
+			find();
+		}
+
+		ImGui::SameLine();
+
+		if (latchButton("[]", &wholeWordFind, ImVec2(optionWidth, 0.0f))) {
+			find();
+		}
+
+		ImGui::SameLine();
+
+		if (ImGui::Button("x", ImVec2(optionWidth, 0.0f))) {
+			findReplaceVisible = false;
+			focusOnEditor = true;
+		}
+
+		if (!readOnly) {
+			ImGui::SetNextItemWidth(fieldWidth);
+			inputString("###replace", &replaceText);
+			ImGui::SameLine();
+
+			bool disableReplaceButtons = !findText.size() || !replaceText.size();
+
+			if (disableReplaceButtons) {
+				ImGui::BeginDisabled();
+			}
+
+			if (ImGui::Button(replaceButtonLabel.c_str(), ImVec2(button1Width, 0.0f))) {
+				replace();
+			}
+
+			ImGui::SameLine();
+
+			if (ImGui::Button(replaceAllButtonLabel.c_str(), ImVec2(button2Width, 0.0f))) {
+				replaceAll();
+			}
+
+			if (disableReplaceButtons) {
+				ImGui::EndDisabled();
+			}
+		}
+
+		ImGui::EndChild();
 	}
 }
 
@@ -465,6 +780,11 @@ void TextEditor::handleKeyboardInputs() {
 		else if (!readOnly && isAltOnly && ImGui::IsKeyPressed(ImGuiKey_DownArrow)) { moveDownLines(); }
 		else if (!readOnly && language && isShortcut && ImGui::IsKeyPressed(ImGuiKey_Slash)) { toggleComments(); }
 
+		// find/replace support
+		else if (isShortcut && ImGui::IsKeyPressed(ImGuiKey_F)) { openFindReplace(); }
+		else if (isShiftShortcut && ImGui::IsKeyPressed(ImGuiKey_F)) { findAll(); }
+		else if (isShortcut && ImGui::IsKeyPressed(ImGuiKey_G)) { findNext(); }
+
 		// change insert mode
 		else if (isNoModifiers && ImGui::IsKeyPressed(ImGuiKey_Insert)) { overwrite = !overwrite; }
 
@@ -490,11 +810,12 @@ void TextEditor::handleKeyboardInputs() {
 
 		// handle regular text
 		if (!readOnly && !io.InputQueueCharacters.empty()) {
-			for (int i = 0; i < io.InputQueueCharacters.Size; i++) {
+			for (int i = 0; i < io.InputQueueCharacters.size(); i++) {
 				auto character = io.InputQueueCharacters[i];
 
-				if (character == '\n' || character >= 32)
+				if (character == '\n' || character >= 32) {
 					handleCharacter(character);
+				}
 			}
 
 			io.InputQueueCharacters.resize(0);
@@ -508,25 +829,20 @@ void TextEditor::handleKeyboardInputs() {
 //
 
 void TextEditor::handleMouseInteractions() {
-	// pan with dragging middle mouse button
-	if (ImGui::IsMouseDragging(ImGuiMouseButton_Middle)) {
-		ImVec2 mouseDelta = ImGui::GetMouseDragDelta(ImGuiMouseButton_Middle);
-		ImGui::SetScrollX(ImGui::GetScrollX() - mouseDelta.x);
-		ImGui::SetScrollY(ImGui::GetScrollY() - mouseDelta.y);
-		ImGui::ResetMouseDragDelta(ImGuiMouseButton_Middle);
-
-	// ignore other interactions when the editor is not hovered
-	} else if (ImGui::IsWindowHovered()) {
+	// ignore interactions when the editor is not hovered
+	if (ImGui::IsWindowHovered()) {
 		auto io = ImGui::GetIO();
 		ImVec2 mousePos = ImGui::GetMousePos() - ImGui::GetCursorScreenPos();
-		bool overLineNumbers = showLineNumbers && (mousePos.x - ImGui::GetScrollX() < textStart);
+		ImVec2 absoluteMousePos = ImGui::GetMousePos() - ImGui::GetWindowPos();
+		bool overLineNumbers = showLineNumbers && absoluteMousePos.x > lineNumberLeftOffset && absoluteMousePos.x < lineNumberRightOffset;
+		bool overText = mousePos.x - ImGui::GetScrollX() > textOffset;
 
 		auto mouseCoord = document.normalizeCoordinate(Coordinate(
 			static_cast<int>(std::floor(mousePos.y / glyphSize.y)),
-			static_cast<int>(std::floor((mousePos.x - textStart) / glyphSize.x))));
+			static_cast<int>(std::round((mousePos.x - textOffset) / glyphSize.x))));
 
 		// show text cursor if required
-		if (ImGui::IsWindowFocused() && !overLineNumbers) {
+		if (ImGui::IsWindowFocused() && overText) {
 			ImGui::SetMouseCursor(ImGuiMouseCursor_TextInput);
 		}
 
@@ -544,7 +860,26 @@ void TextEditor::handleMouseInteractions() {
 				cursors.updateCurrentCursor(mouseCoord);
 			}
 
-			ensureCursorIsVisible = true;
+			makeCursorVisible();
+
+		} else if (ImGui::IsMouseDragging(ImGuiMouseButton_Middle) && overText) {
+			// pan with dragging middle mouse button
+			ImVec2 mouseDelta = ImGui::GetMouseDragDelta(ImGuiMouseButton_Middle);
+			ImGui::SetScrollX(ImGui::GetScrollX() - mouseDelta.x);
+			ImGui::SetScrollY(ImGui::GetScrollY() - mouseDelta.y);
+			ImGui::ResetMouseDragDelta(ImGuiMouseButton_Middle);
+
+		} else if (ImGui::IsMouseClicked(ImGuiMouseButton_Right)) {
+			// handle right clicks by setting up context menu (if required)
+			if (overLineNumbers && lineNumberContextMenuCallback) {
+				contextMenuLine = mouseCoord.line;
+				ImGui::OpenPopup("LineNumberContextMenu");
+
+			} else if (overText && textContextMenuCallback) {
+				contextMenuLine = mouseCoord.line;
+				contextMenuColumn = mouseCoord.column;
+				ImGui::OpenPopup("TextContextMenu");
+			}
 
 		} else {
 			// handle left mouse button actions
@@ -559,7 +894,7 @@ void TextEditor::handleMouseInteractions() {
 
 			if (tripleClick) {
 				// left mouse button triple click
-				if (!overLineNumbers) {
+				if (overText) {
 					auto start = document.getStartOfLine(mouseCoord);
 					auto end = document.getDown(start);
 					cursors.updateCurrentCursor(start, end);
@@ -567,7 +902,7 @@ void TextEditor::handleMouseInteractions() {
 
 			} else if (doubleClick) {
 				// left mouse button double click
-				if (!overLineNumbers) {
+				if (overText) {
 					auto start = document.findWordStart(mouseCoord);
 					auto end = document.findWordEnd(mouseCoord);
 					cursors.updateCurrentCursor(start, end);
@@ -583,8 +918,8 @@ void TextEditor::handleMouseInteractions() {
 				auto addCursor = ImGui::IsKeyDown(ImGuiMod_Ctrl);
 #endif
 
-				// handle mouse clicks over line numbers
 				if (overLineNumbers) {
+					// handle line number clicks
 					auto start = Coordinate(mouseCoord.line, 0);
 					auto end = document.getDown(start);
 
@@ -599,8 +934,10 @@ void TextEditor::handleMouseInteractions() {
 						cursors.setCursor(start, end);
 					}
 
-				// handle mouse clicks over text
-				} else {
+					makeCursorVisible();
+
+				} else if (overText) {
+					// handle mouse clicks in text
 					if (extendCursor) {
 						cursors.updateCurrentCursor(mouseCoord);
 
@@ -610,6 +947,8 @@ void TextEditor::handleMouseInteractions() {
 					} else {
 						cursors.setCursor(mouseCoord);
 					}
+
+					makeCursorVisible();
 				}
 			}
 		}
@@ -719,6 +1058,7 @@ void TextEditor::paste() {
 void TextEditor::undo() {
 	if (transactions.canUndo()) {
 		transactions.undo(document, cursors);
+		makeCursorVisible();
 	}
 }
 
@@ -730,7 +1070,41 @@ void TextEditor::undo() {
 void TextEditor::redo() {
 	if (transactions.canRedo()) {
 		transactions.redo(document, cursors);
+		makeCursorVisible();
 	}
+}
+
+
+//
+//	TextEditor::getCursor
+//
+
+void TextEditor::getCursor(int& line, int& column, size_t cursor) const {
+	cursor = std::min(cursor, cursors.size() - 1);
+	auto pos = cursors[cursor].getInteractiveEnd();
+	line = pos.line;
+	column = pos.column;
+}
+
+
+//
+//	TextEditor::makeCursorVisible
+//
+
+void TextEditor::makeCursorVisible() {
+	ensureCursorIsVisible = true;
+	scrollToLineNumber = -1;
+}
+
+
+//
+//	TextEditor::scrollToLine
+//
+
+void TextEditor::scrollToLine(int line, Scroll alignment) {
+	ensureCursorIsVisible = false;
+	scrollToLineNumber = line;
+	scrollToAlignment = alignment;
 }
 
 
@@ -738,12 +1112,12 @@ void TextEditor::redo() {
 //	TextEditor::selectFirstOccurrenceOf
 //
 
-void TextEditor::selectFirstOccurrenceOf(const std::string& text, bool caseSensitive, bool wholeWord) {
+void TextEditor::selectFirstOccurrenceOf(const std::string_view& text, bool caseSensitive, bool wholeWord) {
 	Coordinate start, end;
 
 	if (document.findText(Coordinate(0, 0), text, caseSensitive, wholeWord, start, end)) {
 		cursors.setCursor(start, end);
-		ensureCursorIsVisible = true;
+		makeCursorVisible();
 
 	} else {
 		cursors.clearAdditional(true);
@@ -755,12 +1129,12 @@ void TextEditor::selectFirstOccurrenceOf(const std::string& text, bool caseSensi
 //	TextEditor::selectNextOccurrenceOf
 //
 
-void TextEditor::selectNextOccurrenceOf(const std::string& text, bool caseSensitive, bool wholeWord) {
+void TextEditor::selectNextOccurrenceOf(const std::string_view& text, bool caseSensitive, bool wholeWord) {
 	Coordinate start, end;
 
 	if (document.findText(cursors.getCurrent().getSelectionEnd(), text, caseSensitive, wholeWord, start, end)) {
 		cursors.setCursor(start, end);
-		ensureCursorIsVisible = true;
+		makeCursorVisible();
 
 	} else {
 		cursors.clearAdditional(true);
@@ -772,7 +1146,7 @@ void TextEditor::selectNextOccurrenceOf(const std::string& text, bool caseSensit
 //	TextEditor::selectAllOccurrencesOf
 //
 
-void TextEditor::selectAllOccurrencesOf(const std::string& text, bool caseSensitive, bool wholeWord) {
+void TextEditor::selectAllOccurrencesOf(const std::string_view& text, bool caseSensitive, bool wholeWord) {
 	Coordinate start, end;
 
 	if (document.findText(Coordinate(0, 0), text, caseSensitive, wholeWord, start, end)) {
@@ -791,7 +1165,7 @@ void TextEditor::selectAllOccurrencesOf(const std::string& text, bool caseSensit
 			}
 		}
 
-		ensureCursorIsVisible = true;
+		makeCursorVisible();
 
 	} else {
 		cursors.clearAdditional(true);
@@ -830,7 +1204,7 @@ void TextEditor::selectAllOccurrences() {
 //	TextEditor::replaceTextInCurrentCursor
 //
 
-void TextEditor::replaceTextInCurrentCursor(const std::string& text) {
+void TextEditor::replaceTextInCurrentCursor(const std::string_view& text) {
 	auto transaction = startTransaction();
 
 	// first delete old text
@@ -853,10 +1227,111 @@ void TextEditor::replaceTextInCurrentCursor(const std::string& text) {
 //	TextEditor::replaceTextInAllCursors
 //
 
-void TextEditor::replaceTextInAllCursors(const std::string& text) {
+void TextEditor::replaceTextInAllCursors(const std::string_view& text) {
 	auto transaction = startTransaction();
 	insertTextIntoAllCursors(transaction, text);
 	endTransaction(transaction);
+}
+
+
+//
+//	TextEditor::openFindReplace
+//
+
+void TextEditor::openFindReplace() {
+	findReplaceVisible = true;
+	focusOnFind = true;
+}
+
+
+//
+//	TextEditor::find
+//
+
+void TextEditor::find() {
+	if (findText.size()) {
+		selectNextOccurrenceOf(findText, caseSensitiveFind, wholeWordFind);
+		focusOnEditor = true;
+	}
+}
+
+
+//
+//	TextEditor::findNext
+//
+
+void TextEditor::findNext() {
+	if (findText.size()) {
+		selectNextOccurrenceOf(findText, caseSensitiveFind, wholeWordFind);
+		focusOnEditor = true;
+	}
+}
+
+
+//
+//	TextEditor::findAll
+//
+
+void TextEditor::findAll() {
+	if (findText.size()) {
+		selectAllOccurrencesOf(findText, caseSensitiveFind, wholeWordFind);
+		focusOnEditor = true;
+	}
+}
+
+
+//
+//	TextEditor::replace
+//
+
+void TextEditor::replace() {
+	if (findText.size()) {
+		if (!cursors.anyHasSelection()) {
+			selectNextOccurrenceOf(findText, caseSensitiveFind, wholeWordFind);
+		}
+
+		replaceTextInCurrentCursor(replaceText);
+		selectNextOccurrenceOf(findText, caseSensitiveFind, wholeWordFind);
+		focusOnEditor = true;
+	}
+}
+
+
+//
+//	TextEditor::replaceAll
+//
+
+void TextEditor::replaceAll() {
+	if (findText.size()) {
+		selectAllOccurrencesOf(findText, caseSensitiveFind, wholeWordFind);
+		replaceTextInAllCursors(replaceText);
+		focusOnEditor = true;
+	}
+}
+
+
+//
+//	TextEditor::addMarker
+//
+
+void TextEditor::addMarker(int line, ImU32 lineNumberColor, ImU32 textColor, const std::string_view& lineNumberTooltip, const std::string_view& textTooltip) {
+	if (line >= 0 && line < document.lineCount()) {
+		markers.emplace_back(lineNumberColor, textColor, lineNumberTooltip, textTooltip);
+		document[line].marker = markers.size();
+	}
+}
+
+
+//
+//	TextEditor::clearMarkers
+//
+
+void TextEditor::clearMarkers() {
+	for (auto& line : document) {
+		line.marker = 0;
+	}
+
+	markers.clear();
 }
 
 
@@ -869,7 +1344,7 @@ void TextEditor::moveUp(int lines, bool select) {
 		cursor.update(document.getUp(cursor.getInteractiveEnd(), lines), select);
 	}
 
-	ensureCursorIsVisible = true;
+	makeCursorVisible();
 }
 
 
@@ -882,7 +1357,7 @@ void TextEditor::moveDown(int lines, bool select) {
 		cursor.update(document.getDown(cursor.getInteractiveEnd(), lines), select);
 	}
 
-	ensureCursorIsVisible = true;
+	makeCursorVisible();
 }
 
 
@@ -895,7 +1370,7 @@ void TextEditor::moveLeft(bool select, bool wordMode) {
 		cursor.update(document.getLeft(cursor.getInteractiveEnd(), wordMode), select);
 	}
 
-	ensureCursorIsVisible = true;
+	makeCursorVisible();
 }
 
 
@@ -908,7 +1383,7 @@ void TextEditor::moveRight(bool select, bool wordMode) {
 		cursor.update(document.getRight(cursor.getInteractiveEnd(), wordMode), select);
 	}
 
-	ensureCursorIsVisible = true;
+	makeCursorVisible();
 }
 
 
@@ -919,7 +1394,7 @@ void TextEditor::moveRight(bool select, bool wordMode) {
 void TextEditor::moveToTop(bool select) {
 	cursors.clearAdditional();
 	cursors.updateCurrentCursor(document.getTop(), select);
-	ensureCursorIsVisible = true;
+	makeCursorVisible();
 }
 
 
@@ -930,7 +1405,7 @@ void TextEditor::moveToTop(bool select) {
 void TextEditor::moveToBottom(bool select) {
 	cursors.clearAdditional();
 	cursors.updateCurrentCursor(document.getBottom(), select);
-	ensureCursorIsVisible = true;
+	makeCursorVisible();
 }
 
 
@@ -941,7 +1416,7 @@ void TextEditor::moveToBottom(bool select) {
 void TextEditor::moveToStartOfLine(bool select) {
 	cursors.clearAdditional();
 	cursors.updateCurrentCursor(document.getStartOfLine(cursors.getCurrent().getInteractiveEnd()), select);
-	ensureCursorIsVisible = true;
+	makeCursorVisible();
 }
 
 
@@ -952,7 +1427,7 @@ void TextEditor::moveToStartOfLine(bool select) {
 void TextEditor::moveToEndOfLine(bool select) {
 	cursors.clearAdditional();
 	cursors.updateCurrentCursor(document.getEndOfLine(cursors.getCurrent().getInteractiveEnd()), select);
-	ensureCursorIsVisible = true;
+	makeCursorVisible();
 }
 
 
@@ -963,7 +1438,7 @@ void TextEditor::moveToEndOfLine(bool select) {
 void TextEditor::moveTo(Coordinate coordinate, bool select) {
 	cursors.clearAdditional();
 	cursors.updateCurrentCursor(coordinate, select);
-	ensureCursorIsVisible = true;
+	makeCursorVisible();
 }
 
 
@@ -982,6 +1457,7 @@ void TextEditor::handleCharacter(ImWchar character) {
 	if (completePairCloser) {
 		if (completePairCloser == character && completePairLocation == cursors.getCurrent().getSelectionEnd()) {
 			completePairCloser = 0;
+			moveRight(false, false);
 			return;
 		}
 
@@ -996,11 +1472,11 @@ void TextEditor::handleCharacter(ImWchar character) {
 				auto end = cursor->getSelectionEnd();
 
 				// insert the opening glyph
-				auto end1 = insertText(transaction, end, std::string(1, closer));
+				auto end1 = insertText(transaction, end, std::string_view(&closer, 1));
 				cursors.adjustForInsert(cursor, start, end1);
 
 				// insert the closing glyph
-				auto end2 = insertText(transaction, start, std::string(1, opener));
+				auto end2 = insertText(transaction, start, std::string_view(&opener, 1));
 				cursors.adjustForInsert(cursor, start, end2);
 
 				// update old selection
@@ -1046,9 +1522,8 @@ void TextEditor::handleCharacter(ImWchar character) {
 		}
 
 		// just insert a regular character
-		std::string utf8(4, 0);
-		std::string text(utf8.begin(), CodePoint::write(utf8.begin(), character));
-		insertTextIntoAllCursors(transaction, text);
+		char utf8[4];
+		insertTextIntoAllCursors(transaction, std::string_view(utf8, CodePoint::write(utf8, character)));
 	}
 
 	endTransaction(transaction);
@@ -1166,7 +1641,7 @@ void TextEditor::indentLines() {
 
 		// process all lines in this cursor
 		for (auto line = cursorStart.line; line <= cursorEnd.line; line++) {
-			if (Coordinate(line, 0) != cursorEnd && document[line].glyphs()) {
+			if (Coordinate(line, 0) != cursorEnd && document[line].size()) {
 				auto insertStart = Coordinate(line, 0);
 				auto insertEnd = insertText(transaction, insertStart, "\t");
 				cursors.adjustForInsert(cursor, insertStart, insertEnd);
@@ -1197,11 +1672,11 @@ void TextEditor::deindentLines() {
 		auto tabSize = document.getTabSize();
 
 		for (auto line = cursorStart.line; line <= cursorEnd.line; line++) {
-			// determine how many whitespace are available at the start with a max of 4 columns
+			// determine how many whitespaces are available at the start with a max of 4 columns
 			int column = 0;
-			int index = 0;
+			size_t index = 0;
 
-			while (column < 4 && index < document[line].glyphs() && std::isblank(document[line][index].codepoint)) {
+			while (column < 4 && index < document[line].size() && std::isblank(document[line][index].codepoint)) {
 				column += document[line][index].codepoint == '\t' ? tabSize - (column % tabSize) : 1;
 				index++;
 			}
@@ -1304,16 +1779,16 @@ void TextEditor::toggleComments() {
 
 		// process all lines in this cursor
 		for (auto line = cursorStart.line; line <= cursorEnd.line; line++) {
-			if (Coordinate(line, 0) != cursorEnd && document[line].glyphs()) {
+			if (Coordinate(line, 0) != cursorEnd && document[line].size()) {
 				// see if line starts with a comment (after possible leading whitespaces)
-				int start = 0;
-				int i = 0;
+				size_t start = 0;
+				size_t i = 0;
 
-				while (start < document[line].glyphs() && CodePoint::isWhiteSpace(document[line][start].codepoint)) {
+				while (start < document[line].size() && CodePoint::isWhiteSpace(document[line][start].codepoint)) {
 					start++;
 				}
 
-				while (start + i < document[line].glyphs() && i < comment.size() && document[line][start + i].codepoint == comment[i]) {
+				while (start + i < document[line].size() && i < comment.size() && document[line][start + i].codepoint == comment[i]) {
 					i++;
 				}
 
@@ -1340,7 +1815,7 @@ void TextEditor::toggleComments() {
 //	TextEditor::filterSelections
 //
 
-void TextEditor::filterSelections(std::function<std::string(std::string)> filter) {
+void TextEditor::filterSelections(std::function<std::string(std::string_view)> filter) {
 	auto transaction = startTransaction();
 
 	// process all cursors
@@ -1350,7 +1825,7 @@ void TextEditor::filterSelections(std::function<std::string(std::string)> filter
 
 		// process all lines in this cursor
 		for (auto line = start.line; line <= end.line; line++) {
-			if (Coordinate(line, 0) != end && document[line].glyphs()) {
+			if (Coordinate(line, 0) != end && document[line].size()) {
 				// get original text and run it through filter
 				auto before = document.getSectionText(start, end);
 				std::string after = filter(before);
@@ -1376,16 +1851,16 @@ void TextEditor::filterSelections(std::function<std::string(std::string)> filter
 //
 
 void TextEditor::selectionToLowerCase() {
-	FilterSelections([](const std::string& text) {
+	FilterSelections([](const std::string_view& text) {
 		std::string result;
 		auto end = text.end();
 		auto i = text.begin();
-		std::string utf8(4, 0);
+		char utf8[4];
 
 		while (i < end) {
 			ImWchar codepoint;
 			i = CodePoint::read(i, end, &codepoint);
-			result.append(utf8.begin(), CodePoint::write(utf8.begin(), CodePoint::toLower(codepoint)));
+			result.append(utf8, CodePoint::write(utf8, CodePoint::toLower(codepoint)));
 		}
 
 		return result;
@@ -1398,16 +1873,16 @@ void TextEditor::selectionToLowerCase() {
 //
 
 void TextEditor::selectionToUpperCase() {
-	FilterSelections([](const std::string& text) {
+	FilterSelections([](const std::string_view& text) {
 		std::string result;
 		auto end = text.end();
 		auto i = text.begin();
-		std::string utf8(4, 0);
+		char utf8[4];
 
 		while (i < end) {
 			ImWchar codepoint;
 			i = CodePoint::read(i, end, &codepoint);
-			result.append(utf8.begin(), CodePoint::write(utf8.begin(), CodePoint::toUpper(codepoint)));
+			result.append(utf8, CodePoint::write(utf8, CodePoint::toUpper(codepoint)));
 		}
 
 		return result;
@@ -1423,26 +1898,32 @@ void TextEditor::stripTrailingWhitespaces() {
 	auto transaction = startTransaction();
 
 	// process all the lines
-	for (int i = 0; i < document.lines(); i++) {
+	for (int i = 0; i < document.lineCount(); i++) {
 		auto& line = document[i];
-		int size = line.glyphs();
-		int whitespace = -1;
+		size_t lineSize = line.size();
+		size_t whitespace = std::numeric_limits<std::size_t>::max();
 		bool done = false;
 
 		// look for first non-whitespace glyph at the end of the line
-		for (auto index = size - 1; !done && index >= 0; index--) {
-			if (CodePoint::isWhiteSpace(line[index].codepoint)) {
-				whitespace = index;
+		if (lineSize) {
+			for (auto index = lineSize - 1; !done; index--) {
+				if (CodePoint::isWhiteSpace(line[index].codepoint)) {
+					whitespace = index;
 
-			} else {
-				done = true;
+					if (index == 0) {
+						done = true;
+					}
+
+				} else {
+					done = true;
+				}
 			}
 		}
 
 		// remove whitespaces (if required)
-		if (whitespace >= 0) {
+		if (whitespace != std::numeric_limits<std::size_t>::max()) {
 			auto start = Coordinate(i, document.getColumn(line, whitespace));
-			auto end = Coordinate(i, document.getColumn(line, size));
+			auto end = Coordinate(i, document.getColumn(line, lineSize));
 			deleteText(transaction, start, end);
 		}
 	}
@@ -1458,11 +1939,11 @@ void TextEditor::stripTrailingWhitespaces() {
 //	TextEditor::filterLines
 //
 
-void TextEditor::filterLines(std::function<std::string(std::string)> filter) {
+void TextEditor::filterLines(std::function<std::string(std::string_view)> filter) {
 	auto transaction = startTransaction();
 
 	// process all the lines
-	for (int i = 0; i < document.lines(); i++) {
+	for (int i = 0; i < document.lineCount(); i++) {
 		// get original text and run it through filter
 		auto before = document.getLineText(i);
 		std::string after = filter(before);
@@ -1488,7 +1969,7 @@ void TextEditor::filterLines(std::function<std::string(std::string)> filter) {
 //
 
 void TextEditor::tabsToSpaces() {
-	filterLines([this](const std::string& input) {
+	filterLines([this](const std::string_view& input) {
 		auto tabSize = document.getTabSize();
 		std::string output;
 
@@ -1511,7 +1992,7 @@ void TextEditor::tabsToSpaces() {
 //
 
 void TextEditor::spacesToTabs() {
-	FilterLines([this](const std::string& input) {
+	FilterLines([this](const std::string_view& input) {
 		auto tabSize = document.getTabSize();
 		std::string output;
 		int pos = 0;
@@ -1595,7 +2076,7 @@ bool TextEditor::endTransaction(std::shared_ptr<Transaction> transaction) {
 //	TextEditor::insertTextIntoAllCursors
 //
 
-void TextEditor::insertTextIntoAllCursors(std::shared_ptr<Transaction> transaction, const std::string& text) {
+void TextEditor::insertTextIntoAllCursors(std::shared_ptr<Transaction> transaction, const std::string_view& text) {
 	// delete any selection content first
 	deleteTextFromAllCursors(transaction);
 
@@ -1660,8 +2141,9 @@ void TextEditor::autoIndentAllCursors(std::shared_ptr<Transaction> transaction) 
 		// determine whitespace at start of current line
 		std::string whitespace;
 
-		for (auto i = 0; i < line.size() && CodePoint::isWhiteSpace(line[i].codepoint); i++) {
-			whitespace += line[i].codepoint;
+		for (size_t i = 0; i < line.size() && CodePoint::isWhiteSpace(line[i].codepoint); i++) {
+			char utf8[4];
+			whitespace.append(utf8, CodePoint::write(utf8, line[i].codepoint));
 		}
 
 		// determine text to insert
@@ -1694,11 +2176,12 @@ void TextEditor::autoIndentAllCursors(std::shared_ptr<Transaction> transaction) 
 //	TextEditor::insertText
 //
 
-TextEditor::Coordinate TextEditor::insertText(std::shared_ptr<Transaction> transaction, Coordinate start, const std::string& text) {
+TextEditor::Coordinate TextEditor::insertText(std::shared_ptr<Transaction> transaction, Coordinate start, const std::string_view& text) {
 	// update document, add transaction and return coordinate of end of insert
 	// this function does not touch the cursors
 	auto end = document.insertText(start, text);
 	transaction->addInsert(start, end, text);
+	makeCursorVisible();
 	return end;
 }
 
@@ -1713,31 +2196,7 @@ void TextEditor::deleteText(std::shared_ptr<Transaction> transaction, Coordinate
 	auto text = document.getSectionText(start, end);
 	document.deleteText(start, end);
 	transaction->addDelete(start, end, text);
-}
-
-
-//
-//	TextEditor::AddErrorMarker
-//
-
-void TextEditor::AddErrorMarker(int line, const std::string &marker) {
-	if (line >= 0 && line < document.lines()) {
-		errorMarkers.emplace_back(marker);
-		document[line].errorMarker = errorMarkers.size();
-	}
-}
-
-
-//
-//	TextEditor::ClearErrorMarkers
-//
-
-void TextEditor::ClearErrorMarkers() {
-	for (auto& line : document) {
-		line.errorMarker = 0;
-	}
-
-	errorMarkers.clear();
+	makeCursorVisible();
 }
 
 
@@ -1749,7 +2208,7 @@ void TextEditor::updatePalette() {
 	// Update palette with the current alpha from style
 	paletteAlpha = ImGui::GetStyle().Alpha;
 
-	for (int i = 0; i < static_cast<size_t>(Color::count); i++) {
+	for (size_t i = 0; i < static_cast<size_t>(Color::count); i++) {
 		auto color = ImGui::ColorConvertU32ToFloat4(paletteBase[i]);
 		color.w *= paletteAlpha;
 		palette[i] = ImGui::ColorConvertFloat4ToU32(color);
@@ -1776,8 +2235,8 @@ const TextEditor::Palette& TextEditor::GetDarkPalette() {
 		IM_COL32( 30,  30,  30, 255),	// background
 		IM_COL32(224, 224, 224, 255),	// cursor
 		IM_COL32( 32,  96, 160, 255),	// selection
-		IM_COL32(128,   0,  32, 255),	// errorMarker
-		IM_COL32( 90,  90,  90, 255),	// whitespace
+		IM_COL32( 80,  80,  80, 255),	// whitespace
+		IM_COL32( 70,  70,  70, 255),	// matchingBracketBackground
 		IM_COL32(140, 140, 140, 255),	// matchingBracketActive
 		IM_COL32(246, 222,  36, 255),	// matchingBracketLevel1
 		IM_COL32( 66, 120, 198, 255),	// matchingBracketLevel2
@@ -1785,9 +2244,6 @@ const TextEditor::Palette& TextEditor::GetDarkPalette() {
 		IM_COL32(198,   8,  32, 255),	// matchingBracketError
 		IM_COL32(128, 128, 144, 255),	// line number
 		IM_COL32(224, 224, 240, 255),	// current line number
-		IM_COL32(255, 0,   0,   255),   // breakpoint
-		IM_COL32(255, 255, 0,   255),   // current statement
-		IM_COL32(170, 170, 255, 255),   // return statement
 	}};
 
 	return p;
@@ -1797,30 +2253,27 @@ const TextEditor::Palette& TextEditor::GetLightPalette()
 {
 	const static Palette p = {{
 		IM_COL32( 64,  64,  64, 255),	// text
-		IM_COL32(  6,  12, 255, 255),	// keyword
-		IM_COL32(  6,  12, 255, 255),	// declaration
-		IM_COL32(  0, 128,   0, 255),	// number
+		IM_COL32( 170,  0, 220, 255),	// keyword
+		IM_COL32( 65,   0, 255, 255),	// declaration
+		IM_COL32( 40, 140,  90, 255),	// number
 		IM_COL32(160,  32,  32, 255),	// string
 		IM_COL32(  0,   0,   0, 255),	// punctuation
 		IM_COL32( 96,  96,  64, 255),	// preprocessor
 		IM_COL32( 64,  64,  64, 255),	// identifier
 		IM_COL32( 16,  96,  96, 255),	// known identifier
-		IM_COL32( 32,  80,  32, 255),	// comment
+		IM_COL32( 35, 135,   5, 255),	// comment
 		IM_COL32(255, 255, 255, 255),	// background
 		IM_COL32(  0,   0,   0, 255),	// cursor
 		IM_COL32(  0,   0,  96,  64),	// selection
-		IM_COL32(255,  16,   0, 160),	// errorMarker
 		IM_COL32(144, 144, 144, 144),	// whitespace
+		IM_COL32(180, 180, 180, 144),	// matchingBracketBackground
 		IM_COL32( 72,  72,  72, 255),	// matchingBracketActive
-		IM_COL32(246, 222,  36, 255),	// matchingBracketLevel1
-		IM_COL32( 66, 120, 198, 255),	// matchingBracketLevel2
-		IM_COL32(213,  96, 213, 255),	// matchingBracketLevel3
+		IM_COL32( 70,   0, 250, 255),	// matchingBracketLevel1
+		IM_COL32( 80, 160,  70, 255),	// matchingBracketLevel2
+		IM_COL32(120,  60, 25, 255),	// matchingBracketLevel3
 		IM_COL32(198,   8,  32, 255),	// matchingBracketError
 		IM_COL32(  0,  80,  80, 255),	// line number
 		IM_COL32(  0,   0,   0, 255),	// current line number
-		IM_COL32(255, 0,   0,   255),   // breakpoint
-		IM_COL32(255, 255, 0,   255),   // current statement
-		IM_COL32(170, 170, 255, 255),   // return statement
 	}};
 
 	return p;
@@ -1833,11 +2286,11 @@ TextEditor::Palette TextEditor::defaultPalette = TextEditor::GetDarkPalette();
 //	TextEditor::Cursor::adjustCoordinateForInsert
 //
 
-TextEditor::Coordinate TextEditor::Cursor::adjustCoordinateForInsert(Coordinate coordinate, Coordinate start, Coordinate end) {
-	coordinate.line += end.line - start.line;
+TextEditor::Coordinate TextEditor::Cursor::adjustCoordinateForInsert(Coordinate coordinate, Coordinate insertStart, Coordinate insertEnd) {
+	coordinate.line += insertEnd.line - insertStart.line;
 
 	if (end.line == coordinate.line) {
-		coordinate.column += end.column;
+		coordinate.column += insertEnd.column - insertStart.column;
 	}
 
 	return coordinate;
@@ -1858,11 +2311,11 @@ void TextEditor::Cursor::adjustForInsert(Coordinate insertStart, Coordinate inse
 //	TextEditor::Cursor::adjustCoordinateForDelete
 //
 
-TextEditor::Coordinate TextEditor::Cursor::adjustCoordinateForDelete(Coordinate coordinate, Coordinate start, Coordinate end) {
-	coordinate.line -= end.line - start.line;
+TextEditor::Coordinate TextEditor::Cursor::adjustCoordinateForDelete(Coordinate coordinate, Coordinate deleteStart, Coordinate deleteEnd) {
+	coordinate.line -= deleteEnd.line - deleteStart.line;
 
-	if (end.line == coordinate.line) {
-		coordinate.column -= end.column;
+	if (deleteEnd.line == coordinate.line) {
+		coordinate.column -= deleteEnd.column - deleteStart.column;
 	}
 
 	return coordinate;
@@ -1883,9 +2336,9 @@ void TextEditor::Cursor::adjustForDelete(Coordinate deleteStart, Coordinate dele
 //	TextEditor::Cursors::setCursor
 //
 
-void TextEditor::Cursors::setCursor(Coordinate start, Coordinate end) {
+void TextEditor::Cursors::setCursor(Coordinate cursorStart, Coordinate cursorEnd) {
 	clear();
-	emplace_back(start, end);
+	emplace_back(cursorStart, cursorEnd);
 	front().setMain(true);
 	front().setCurrent(true);
 	main = 0;
@@ -2053,7 +2506,7 @@ void TextEditor::Cursors::update() {
 		}
 
 		// find current cursor
-		for (auto c = 0; c < size(); c++) {
+		for (size_t c = 0; c < size(); c++) {
 			if (at(c).isCurrent()) {
 				current = c;
 			}
@@ -2088,7 +2541,7 @@ void TextEditor::Cursors::adjustForDelete(iterator start, Coordinate deleteStart
 //	TextEditor::Document::setText
 //
 
-void TextEditor::Document::setText(const std::string& text) {
+void TextEditor::Document::setText(const std::string_view& text) {
 	// reset document
 	clear();
 	emplace_back();
@@ -2109,6 +2562,9 @@ void TextEditor::Document::setText(const std::string& text) {
 			back().emplace_back(Glyph(character, Color::text));
 		}
 	}
+
+	// update maximum column counts
+	updateMaximumColumn(0, lineCount() - 1);
 }
 
 
@@ -2116,7 +2572,7 @@ void TextEditor::Document::setText(const std::string& text) {
 //	TextEditor::Document::insertText
 //
 
-TextEditor::Coordinate TextEditor::Document::insertText(Coordinate start, const std::string& text) {
+TextEditor::Coordinate TextEditor::Document::insertText(Coordinate start, const std::string_view& text) {
 	auto line = begin() + start.line;
 	auto index = getIndex(start);
 	auto lineNo = start.line;
@@ -2136,8 +2592,8 @@ TextEditor::Coordinate TextEditor::Document::insertText(Coordinate start, const 
 			line = begin() + lineNo;
 			auto nextLine = begin() + ++lineNo;
 
-			for (auto i = line->begin() + index; i < line->end(); i++) {
-				nextLine->push_back(*i);
+			for (auto j = line->begin() + index; j < line->end(); j++) {
+				nextLine->push_back(*j);
 			}
 
 			line->erase(line->begin() + index, line->end());
@@ -2150,13 +2606,16 @@ TextEditor::Coordinate TextEditor::Document::insertText(Coordinate start, const 
 		}
 	}
 
-	// determine end-of insert
+	// determine end of insert
 	auto end = Coordinate(lineNo, getColumn(static_cast<int>(line - begin()), index));
 
 	// mark affected lines for colorization
-	for (auto line = start.line; line <= end.line; line++) {
-		at(line).colorize = true;
+	for (auto j = start.line; j <= end.line; j++) {
+		at(j).colorize = true;
 	}
+
+	// update maximum column counts
+	updateMaximumColumn(start.line, end.line);
 
 	updated = true;
 	return end;
@@ -2186,7 +2645,6 @@ void TextEditor::Document::deleteText(Coordinate start, Coordinate end) {
 		erase(begin() + start.line + 1, begin() + end.line);
 
 		// remove end of first line
-		auto& startLine = at(start.line);
 		startLine.erase(startLine.begin() + startIndex, startLine.end());
 
 		// join lines
@@ -2196,12 +2654,14 @@ void TextEditor::Document::deleteText(Coordinate start, Coordinate end) {
 	}
 
 	// mark affected lines for colorization
-	auto last = (start.line == lines() - 1) ? start.line : start.line + 1;
+	auto last = (start.line == lineCount() - 1) ? start.line : start.line + 1;
 
 	for (auto line = start.line; line <= last; line++) {
 		at(line).colorize = true;
 	}
 
+	// update maximum column counts
+	updateMaximumColumn(start.line, end.line);
 	updated = true;
 }
 
@@ -2213,14 +2673,14 @@ void TextEditor::Document::deleteText(Coordinate start, Coordinate end) {
 std::string TextEditor::Document::getText() const {
 	// process all glyphs and generate UTF-8 output
 	std::string text;
-	std::string utf8(4, 0);
+	char utf8[4];
 
-	for (auto i = begin(); i < end(); i++) {
-		for (auto& glyph : *i) {
-			text.append(utf8.begin(), CodePoint::write(utf8.begin(), glyph.codepoint));
+	for (auto line = begin(); line < end(); line++) {
+		for (auto glyph = line->begin(); glyph < line->end(); glyph++) {
+			text.append(std::string_view(utf8, CodePoint::write(utf8, glyph->codepoint)));
 		}
 
-		if (i < end() - 1) {
+		if (line < end() - 1) {
 			text += "\n";
 		}
 	}
@@ -2239,15 +2699,15 @@ std::string TextEditor::Document::getSectionText(Coordinate start, Coordinate en
 	auto lineNo = start.line;
 	auto index = getIndex(start);
 	auto endIndex = getIndex(end);
-	std::string utf8(4, 0);
+	char utf8[4];
 
 	while (lineNo < end.line || index < endIndex) {
 		auto& line = at(lineNo);
 
-		if (index < line.glyphs()) {
-			section.append(utf8.begin(), CodePoint::write(utf8.begin(), line[index].codepoint));
-
+		if (index < line.size()) {
+			section.append(std::string_view(utf8, CodePoint::write(utf8, line[index].codepoint)));
 			index++;
+
 		} else {
 			section += '\n';
 			lineNo++;
@@ -2264,39 +2724,33 @@ std::string TextEditor::Document::getSectionText(Coordinate start, Coordinate en
 //
 
 std::string TextEditor::Document::getLineText(int line) const {
-	return getSectionText(Coordinate(line, 0), Coordinate(line, maxColumn(line)));
+	return getSectionText(Coordinate(line, 0), Coordinate(line, at(line).maxColumn));
 }
 
 
 //
-//	TextEditor::Document::maxColumn
+//	TextEditor::Document::updateMaximumColumn
 //
 
-int TextEditor::Document::maxColumn() const {
-	// determine the maximum column number for this document
-	int result = 0;
+void TextEditor::Document::updateMaximumColumn(int first, int last) {
+	// process specified lines
+	for (auto line = begin() + first; line <= begin() + last; line++) {
+		// determine the maximum column number for this line
+		int column = 0;
 
-	for (auto& line : *this) {
-		result = std::max(result, maxColumn(line));
+		for (auto glyph = line->begin(); glyph < line->end(); glyph++) {
+			column = (glyph->codepoint == '\t') ? ((column / tabSize) + 1) * tabSize : column + 1;
+		}
+
+		line->maxColumn = column;
 	}
 
-	return result;
-}
+	// determine maximum line number in document
+	maxColumn = 0;
 
-
-//
-//	TextEditor::Document::maxColumn
-//
-
-int TextEditor::Document::maxColumn(const Line& line) const {
-	// determine the maximum column number for this line
-	int column = 0;
-
-	for (auto glyph = line.begin(); glyph < line.end(); glyph++) {
-		column = (glyph->codepoint == '\t') ? ((column / tabSize) + 1) * tabSize : column + 1;
+	for (auto line = begin(); line < end(); line++) {
+		maxColumn = std::max(maxColumn, line->maxColumn);
 	}
-
-	return column;
 }
 
 
@@ -2304,17 +2758,17 @@ int TextEditor::Document::maxColumn(const Line& line) const {
 //	TextEditor::Document::getIndex
 //
 
-int TextEditor::Document::getIndex(const Line& line, int column) const {
+size_t TextEditor::Document::getIndex(const Line& line, int column) const {
 	// convert a column reference to a glyph index for a specified line (taking tabs into account)
 	auto end = line.end();
-	int index = 0;
+	size_t index = 0;
 	int c = 0;
 
 	for (auto glyph = line.begin(); glyph < end; glyph++) {
 		if (c == column) {
 			return index;
 
-		} if (c > column) {
+		} else if (c > column) {
 			return index - 1;
 		}
 
@@ -2330,7 +2784,7 @@ int TextEditor::Document::getIndex(const Line& line, int column) const {
 //	TextEditor::Document::getColumn
 //
 
-int TextEditor::Document::getColumn(const Line& line, int index) const {
+int TextEditor::Document::getColumn(const Line& line, size_t index) const {
 	// convert a glyph index to a column reference for the specified line (taking tabs into account)
 	auto end = line.begin() + index;
 	int column = 0;
@@ -2367,19 +2821,25 @@ TextEditor::Coordinate TextEditor::Document::getDown(Coordinate from, int lines)
 
 TextEditor::Coordinate TextEditor::Document::getLeft(Coordinate from, bool wordMode) const {
 	if (wordMode) {
-		if (from.column == 0) {
-			if (from.line) {
-				from = Coordinate(from.line - 1, maxColumn(from.line - 1));
-			}
+		// first move left by one glyph
+		from = getLeft(from);
+		auto& line = at(from.line);
+		auto index = getIndex(from);
+
+		// now skip all whitespaces
+		while (index > 0 && CodePoint::isWhiteSpace(line[index].codepoint)) {
+			index--;
 		}
 
-		return findWordStart(from);
+		// find the start of the current word
+		return findWordStart(Coordinate(from.line, getColumn(from.line, index)));
 
 	} else {
+		// calculate coordinate of previous glyph (could be on previous line)
 		auto index = getIndex(from);
 
 		if (index == 0) {
-			return (from.line > 0) ? Coordinate(from.line - 1, maxColumn(from.line - 1)) : from;
+			return (from.line > 0) ? Coordinate(from.line - 1, at(from.line - 1).maxColumn) : from;
 
 		} else {
 			return Coordinate(from.line, getColumn(from.line, index - 1));
@@ -2394,19 +2854,26 @@ TextEditor::Coordinate TextEditor::Document::getLeft(Coordinate from, bool wordM
 
 TextEditor::Coordinate TextEditor::Document::getRight(Coordinate from, bool wordMode) const {
 	if (wordMode) {
-		if (isEndOfLine(from)) {
-			if (from.line < lines() - 1) {
-				from = Coordinate(from.line + 1, 0);
-			}
+		// first move right by one glyph
+		from = getRight(from);
+		auto& line = at(from.line);
+		auto index = getIndex(from);
+		auto lineSize = line.size();
+
+		// now skip all whitespaces
+		while (index < lineSize && CodePoint::isWhiteSpace(line[index].codepoint)) {
+			index++;
 		}
 
-		return findWordEnd(from);
+		// find the end of the current word
+		return findWordEnd(Coordinate(from.line, getColumn(from.line, index)));
 
 	} else {
+		// calculate coordinate of next glyph (could be on next line)
 		auto index = getIndex(from);
 
-		if (index == at(from.line).glyphs()) {
-			return (from.line < lines() - 1) ? Coordinate(from.line + 1, 0) : from;
+		if (index == at(from.line).size()) {
+			return (from.line < lineCount() - 1) ? Coordinate(from.line + 1, 0) : from;
 
 		} else {
 			return Coordinate(from.line, getColumn(from.line, index + 1));
@@ -2429,8 +2896,8 @@ TextEditor::Coordinate TextEditor::Document::getTop() const {
 //
 
 TextEditor::Coordinate TextEditor::Document::getBottom() const {
-	auto lastLine = lines() - 1;
-	return Coordinate(lastLine, maxColumn(lastLine));
+	auto lastLine = lineCount() - 1;
+	return Coordinate(lastLine, at(lastLine).maxColumn);
 }
 
 
@@ -2448,7 +2915,7 @@ TextEditor::Coordinate TextEditor::Document::getStartOfLine(Coordinate from) con
 //
 
 TextEditor::Coordinate TextEditor::Document::getEndOfLine(Coordinate from) const {
-	return Coordinate(from.line, maxColumn(from.line));
+	return Coordinate(from.line, at(from.line).maxColumn);
 }
 
 
@@ -2463,7 +2930,7 @@ TextEditor::Coordinate TextEditor::Document::findWordStart(Coordinate from) cons
 	} else {
 		auto& line = at(from.line);
 		auto index = getIndex(from);
-		auto firstCharacter = line[index - 1].codepoint;
+		auto firstCharacter = line[index].codepoint;
 
 		if (CodePoint::isWhiteSpace(firstCharacter)) {
 			while (index > 0 && CodePoint::isWhiteSpace(line[index - 1].codepoint)) {
@@ -2493,7 +2960,7 @@ TextEditor::Coordinate TextEditor::Document::findWordStart(Coordinate from) cons
 TextEditor::Coordinate TextEditor::Document::findWordEnd(Coordinate from) const {
 	auto& line = at(from.line);
 	auto index = getIndex(from);
-	auto size = line.glyphs();
+	auto size = line.size();
 
 	if (index >= size) {
 		return from;
@@ -2526,7 +2993,7 @@ TextEditor::Coordinate TextEditor::Document::findWordEnd(Coordinate from) const 
 //	TextEditor::Document::findText
 //
 
-bool TextEditor::Document::findText(Coordinate from, const std::string& text, bool caseSensitive, bool wholeWord, Coordinate& start, Coordinate& end) const {
+bool TextEditor::Document::findText(Coordinate from, const std::string_view& text, bool caseSensitive, bool wholeWord, Coordinate& start, Coordinate& end) const {
 	// convert input string to vector of codepoints
 	std::vector<ImWchar> search;
 	auto endOfText = text.end();
@@ -2547,21 +3014,21 @@ bool TextEditor::Document::findText(Coordinate from, const std::string& text, bo
 	do {
 		auto line = searchLine;
 		auto index = searchIndex;
-		auto lineSize = at(line).glyphs();
+		auto lineSize = at(line).size();
 		bool done = false;
-		int i = 0;
+		size_t j = 0;
 
-		while (!done && i < search.size()) {
-			if (search[i] == '\n') {
+		while (!done && j < search.size()) {
+			if (search[j] == '\n') {
 				if (index == lineSize) {
-					if (line == lines() - 1) {
+					if (line == lineCount() - 1) {
 						done = true;
 
 					} else {
 						line++;
 						index = 0;
-						lineSize = at(line).glyphs();
-						i++;
+						lineSize = at(line).size();
+						j++;
 					}
 
 				} else {
@@ -2579,9 +3046,9 @@ bool TextEditor::Document::findText(Coordinate from, const std::string& text, bo
 						ch = CodePoint::toLower(ch);
 					}
 
-					if (ch == search[i]) {
+					if (ch == search[j]) {
 						index++;
-						i++;
+						j++;
 
 					} else {
 						done = true;
@@ -2590,7 +3057,7 @@ bool TextEditor::Document::findText(Coordinate from, const std::string& text, bo
 			}
 		}
 
-		if (i == search.size()) {
+		if (j == search.size()) {
 			start = Coordinate(searchLine, getColumn(searchLine, searchIndex));
 			end = Coordinate(line, getColumn(line, index));
 
@@ -2599,8 +3066,8 @@ bool TextEditor::Document::findText(Coordinate from, const std::string& text, bo
 			}
 		}
 
-		if (searchIndex == at(searchLine).glyphs()) {
-			searchLine = (searchLine == lines() - 1) ? 0 : searchLine + 1;
+		if (searchIndex == at(searchLine).size()) {
+			searchLine = (searchLine == lineCount() - 1) ? 0 : searchLine + 1;
 			searchIndex = 0;
 
 		} else {
@@ -2639,11 +3106,11 @@ TextEditor::Coordinate TextEditor::Document::normalizeCoordinate(Coordinate coor
 	if (coordinate.line < 0) {
 		result = Coordinate(0, 0);
 
-	} else if (coordinate.line >= lines()) {
-		result = Coordinate(lines() - 1, maxColumn(lines() - 1));
+	} else if (coordinate.line >= lineCount()) {
+		result = Coordinate(lineCount() - 1, at(lineCount() - 1).maxColumn);
 
 	} else {
-		result = Coordinate(coordinate.line, std::max(0, std::min(coordinate.column, maxColumn(coordinate.line))));
+		result = Coordinate(coordinate.line, std::max(0, std::min(coordinate.column, at(coordinate.line).maxColumn)));
 	}
 
 	return Coordinate(result.line, getColumn(result.line, getIndex(result)));
@@ -2668,12 +3135,12 @@ void TextEditor::Transactions::add(std::shared_ptr<Transaction> transaction) {
 void TextEditor::Transactions::undo(Document& document, Cursors& cursors) {
 	auto& transaction = at(--undoIndex);
 
-	for (auto i = transaction->rbegin(); i < transaction->rend(); i++) {
-		if (i->type == Action::Type::insertText) {
-			document.deleteText(i->start, i->end);
+	for (auto action = transaction->rbegin(); action < transaction->rend(); action++) {
+		if (action->type == Action::Type::insertText) {
+			document.deleteText(action->start, action->end);
 
 		} else {
-			document.insertText(i->start, i->text);
+			document.insertText(action->start, action->text);
 		}
 	}
 
@@ -2688,12 +3155,12 @@ void TextEditor::Transactions::undo(Document& document, Cursors& cursors) {
 void TextEditor::Transactions::redo(Document& document, Cursors& cursors) {
 	auto& transaction = at(undoIndex++);
 
-	for (auto& action : *transaction) {
-		if (action.type == Action::Type::insertText) {
-			document.insertText(action.start, action.text);
+	for (auto action = transaction->rbegin(); action < transaction->rend(); action++) {
+		if (action->type == Action::Type::insertText) {
+			document.insertText(action->start, action->text);
 
 		} else {
-			document.deleteText(action.start, action.end);
+			document.deleteText(action->start, action->end);
 		}
 	}
 
@@ -2708,22 +3175,19 @@ void TextEditor::Transactions::redo(Document& document, Cursors& cursors) {
 TextEditor::State TextEditor::Colorizer::update(Line& line, const Language* language) {
 	auto state = line.state;
 
-	// process all glyphs in this line
-	auto glyph = line.begin();
-	Iterator end(static_cast<void*>(&line), line.glyphs());
-	Iterator newEnd;
-
+	// process all glyphs on this line
 	auto nonWhiteSpace = false;
-	Color color;
+	auto glyph = line.begin();
 
 	while (glyph < line.end()) {
-		Iterator start(static_cast<void*>(&line), static_cast<int>(glyph - line.begin()));
-
 		if (state == State::inText) {
 			// special handling for preprocessor lines
 			if (!nonWhiteSpace && language->preprocess && glyph->codepoint != language->preprocess && !CodePoint::isWhiteSpace(glyph->codepoint)) {
 				nonWhiteSpace = true;
 			}
+
+			// start parsing glyphs
+			auto start = glyph;
 
 			// mark whitespace characters
 			if (CodePoint::isWhiteSpace(glyph->codepoint)) {
@@ -2774,22 +3238,34 @@ TextEditor::State TextEditor::Colorizer::update(Line& line, const Language* lang
 				glyph = line.end();
 
 			// handle custom tokenizer (if we have one)
-			} else if (language->customTokenizer && (newEnd = language->customTokenizer(start, end, color)) != start) {
-				int size = newEnd - start;
-				setColor(glyph, glyph + size, color);
-				glyph += size;
+			} else if (language->customTokenizer) {
+				Color color;
+				Iterator tokenStart(&*glyph);
+				Iterator lineEnd(line.data() + line.size());
+				Iterator tokenEnd = language->customTokenizer(tokenStart, lineEnd, color);
 
-			// nothing worked so far so it's time to do some tokenizing
-			} else {
+				if (tokenEnd != tokenStart) {
+					auto size = tokenEnd - tokenStart;
+					setColor(glyph, glyph + size, color);
+					glyph += size;
+				}
+			}
+
+			if (glyph == start) {
+				// nothing worked so far so it's time to do some tokenizing
+				Color color;
+				Iterator lineEnd(line.data() + line.size());
+				Iterator tokenStart(&*glyph);
+				Iterator tokenEnd;
+
 				// do we have an identifier
-				if (language->getIdentifier && (newEnd = language->getIdentifier(start, end)) != start) {
-					int size = newEnd - start;
-
+				if (language->getIdentifier && (tokenEnd = language->getIdentifier(tokenStart, lineEnd)) != tokenStart) {
 					// determine identifier text and color color
+					auto size = tokenEnd - tokenStart;
 					std::string identifier;
 					color = Color::identifier;
 
-					for (auto i = start; i < newEnd; i++) {
+					for (auto i = tokenStart; i < tokenEnd; i++) {
 						identifier += *i;
 					}
 
@@ -2808,8 +3284,8 @@ TextEditor::State TextEditor::Colorizer::update(Line& line, const Language* lang
 					glyph += size;
 
 				// do we have a number
-				} else if (language->getNumber && (newEnd = language->getNumber(start, end)) != start) {
-					int size = newEnd - start;
+				} else if (language->getNumber && (tokenEnd = language->getNumber(tokenStart, lineEnd)) != tokenStart) {
+					auto size = tokenEnd - tokenStart;
 					setColor(glyph, glyph + size, Color::number);
 					glyph += size;
 
@@ -2926,13 +3402,10 @@ void TextEditor::Colorizer::updateEntireDocument(Document& document, const Langu
 	if (language) {
 		for (auto line = document.begin(); line < document.end(); line++) {
 			auto state = update(*line, language);
+			auto next = line + 1;
 
-			if (line != document.end()) {
-				auto next = line + 1;
-
-				if (next != document.end() && next->state != state) {
-					next->state = state;
-				}
+			if (next < document.end()) {
+				next->state = state;
 			}
 		}
 
@@ -2957,14 +3430,11 @@ void TextEditor::Colorizer::updateChangedLines(Document& document, const Languag
 	for (auto line = document.begin(); line < document.end(); line++) {
 		if (line->colorize) {
 			auto state = update(*line, language);
+			auto next = line + 1;
 
-			if (line != document.end()) {
-				auto next = line + 1;
-
-				if (next != document.end() && next->state != state) {
-					next->state = state;
-					next->colorize = true;
-				}
+			if (next < document.end() && next->state != state) {
+				next->state = state;
+				next->colorize = true;
 			}
 		}
 	}
@@ -2975,7 +3445,7 @@ void TextEditor::Colorizer::updateChangedLines(Document& document, const Languag
 //	TextEditor::Colorizer::matches
 //
 
-bool TextEditor::Colorizer::matches(Line::iterator start, Line::iterator end, const std::string& text) {
+bool TextEditor::Colorizer::matches(Line::iterator start, Line::iterator end, const std::string_view& text) {
 	// see if text at iterators matches provided UTF-8 string
 	auto i = text.begin();
 
@@ -2997,6 +3467,17 @@ bool TextEditor::Colorizer::matches(Line::iterator start, Line::iterator end, co
 
 
 //
+//	TextEditor::Bracketeer::reset
+//
+
+void TextEditor::Bracketeer::reset() {
+	clear();
+	active = -1;
+	activeLocation = Coordinate::invalid();
+}
+
+
+//
 //	TextEditor::Bracketeer::update
 //
 
@@ -3007,16 +3488,16 @@ void TextEditor::Bracketeer::update(Document& document) {
 		Color::matchingBracketLevel3
 	};
 
-	clear();
+	reset();
 	std::vector<size_t> levels;
 	int level = 0;
 
 	// process all the glyphs
-	for (auto line = 0; line < document.lines(); line++) {
-		for (auto index = 0; index < document[line].glyphs(); index++) {
+	for (int line = 0; line < document.lineCount(); line++) {
+		for (size_t index = 0; index < document[line].size(); index++) {
 			auto& glyph = document[line][index];
 
-			// handle a bracket opener that is not in a comment, string or preprocessor statement
+			// handle a "bracket opener" that is not in a comment, string or preprocessor statement
 			if (isBracketCandidate(glyph) && isBracketOpener(glyph.codepoint)) {
 				// start a new level
 				levels.emplace_back(size());
@@ -3024,7 +3505,7 @@ void TextEditor::Bracketeer::update(Document& document) {
 				glyph.color = bracketColors[level % 3];
 				level++;
 
-			// handle a bracket closer that is not in a comment, string or preprocessor statement
+			// handle a "bracket closer" that is not in a comment, string or preprocessor statement
 			} else if (isBracketCandidate(glyph) && isBracketCloser(glyph.codepoint)) {
 				if (levels.size()) {
 					auto& lastBracket = at(levels.back());
@@ -3064,15 +3545,15 @@ void TextEditor::Bracketeer::update(Document& document) {
 
 
 //
-//	TextEditor::Bracketeer::getActive
+//	TextEditor::Bracketeer::getActiveBracket
 //
 
-TextEditor::Bracketeer::iterator TextEditor::Bracketeer::getActive(Coordinate location) {
+TextEditor::Bracketeer::iterator TextEditor::Bracketeer::getActiveBracket(Coordinate location) {
 	if (location != activeLocation) {
-		active = end();
+		active = -1;
 		bool done = false;
 
-		for (auto i = begin(); i < end(); i++) {
+		for (auto i = begin(); !done && i < end(); i++) {
 			// skip pairs that start after specified location
 			if (i->isAfter(location)) {
 				done = true;
@@ -3080,14 +3561,14 @@ TextEditor::Bracketeer::iterator TextEditor::Bracketeer::getActive(Coordinate lo
 
 			// brackets are active when they are around specified location
 			else if (i->isAround(location)) {
-				active = i;
+				active = static_cast<int>(i - begin());
 			}
 		}
 
 		activeLocation = location;
 	}
 
-	return active;
+	return active == -1 ? end() : begin() + active;
 }
 
 
@@ -4052,7 +4533,7 @@ C caseRangeToUpper(const T& table, C codepoint) {
 	}
 
 	else {
-		return codepoint + caseRange->toUpper;
+		return static_cast<C>(static_cast<int32_t>(codepoint) + caseRange->toUpper);
 	}
 }
 
@@ -4073,40 +4554,13 @@ C caseRangeToLower(const T& table, C codepoint) {
 	}
 
 	else {
-		return codepoint + caseRange->toLower;
+		return static_cast<C>(static_cast<int32_t>(codepoint) + caseRange->toLower);
 	}
 }
 
 
 //
-//	Statistics
-//
-
-static constexpr size_t totalSizeOfTables16 =
-	sizeof(letters16) +
-	sizeof(lower16) +
-	sizeof(upper16) +
-	sizeof(numbers16) +
-	sizeof(whitespace16) +
-	sizeof(case16);
-
-#if defined(IMGUI_USE_WCHAR32)
-static constexpr size_t totalSizeOfTables32 =
-	sizeof(letters32) +
-	sizeof(lower32) +
-	sizeof(upper32) +
-	sizeof(numbers32) +
-	sizeof(case32);
-
-#else
-static constexpr size_t totalSizeOfTables32 = 0;
-#endif
-
-static constexpr size_t totalSizeOfTables = totalSizeOfTables16 + totalSizeOfTables32;
-
-
-//
-//	Internal type conversions because "char" (in std::string) is signed
+//	Internal type conversions because "char" is signed
 //
 
 static inline ImWchar uch(char c) {
@@ -4122,7 +4576,7 @@ static inline char sch(ImWchar i) {
 //	skipBOM
 //
 
-std::string::const_iterator TextEditor::CodePoint::skipBOM(std::string::const_iterator i, std::string::const_iterator end) {
+std::string_view::const_iterator TextEditor::CodePoint::skipBOM(std::string_view::const_iterator i, std::string_view::const_iterator end) {
 	// skip Byte Order Mark (BOM) just in case there is one
 
 	// Note: the standard states that:
@@ -4138,7 +4592,7 @@ std::string::const_iterator TextEditor::CodePoint::skipBOM(std::string::const_it
 //	TextEditor::CodePoint::read
 //
 
-std::string::const_iterator TextEditor::CodePoint::read(std::string::const_iterator i, std::string::const_iterator end, ImWchar *codepoint) {
+std::string_view::const_iterator TextEditor::CodePoint::read(std::string_view::const_iterator i, std::string_view::const_iterator end, ImWchar *codepoint) {
 	// parse a UTF-8 sequence into a unicode codepoint
 	if (i < end && (uch(*i) & 0x80) == 0) {
 		*codepoint = uch(*i);
@@ -4173,8 +4627,10 @@ std::string::const_iterator TextEditor::CodePoint::read(std::string::const_itera
 //	TextEditor::CodePoint::write
 //
 
-std::string::iterator TextEditor::CodePoint::write(std::string::iterator i, ImWchar codepoint) {
+size_t TextEditor::CodePoint::write(char* start, ImWchar codepoint) {
 	// generate UTF-8 sequence from a unicode codepoint
+	auto i = start;
+
 	if (codepoint < 0x80) {
 		*i++ = sch(codepoint);
 
@@ -4199,19 +4655,16 @@ std::string::iterator TextEditor::CodePoint::write(std::string::iterator i, ImWc
 		*i++ = sch(0x80 | ((codepoint >> 12) & 0x3f));
 		*i++ = sch(0x80 | ((codepoint >> 6) & 0x3f));
 		*i++ = sch(0x80 | (codepoint & 0x3f));
-	}
 
 #else
-	}
-
-	else {
+	} else {
 		*i++ = sch(0xe0 | ((codepoint >> 12) & 0x0f));
 		*i++ = sch(0x80 | ((codepoint >> 6) & 0x3f));
 		*i++ = sch(0x80 | (codepoint & 0x3f));
-	}
 #endif
+	}
 
-	return i;
+	return i - start;
 }
 
 
@@ -4406,24 +4859,6 @@ ImWchar TextEditor::CodePoint::toLower(ImWchar codepoint) {
 	} else {
 		return caseRangeToLower(case16, static_cast<char16_t>(codepoint));
 	}
-}
-
-
-//
-//	TextEditor::Iterator::operator*
-//
-
-TextEditor::Iterator::reference TextEditor::Iterator::operator*() const {
-	return static_cast<Line*>(line)->at(index).codepoint;
-}
-
-
-//
-//	TextEditor::Iterator::operator->
-//
-
-TextEditor::Iterator::pointer TextEditor::Iterator::operator->() const {
-	return &(static_cast<Line*>(line)->at(index).codepoint);
 }
 
 
@@ -5365,7 +5800,7 @@ static bool isCStylePunctuation(ImWchar character) {
 //	TextEditor::Language::C
 //
 
-const TextEditor::Language& TextEditor::Language::C() {
+const TextEditor::Language* TextEditor::Language::C() {
 	static bool initialized = false;
 	static TextEditor::Language language;
 
@@ -5399,7 +5834,7 @@ const TextEditor::Language& TextEditor::Language::C() {
 		initialized = true;
 	}
 
-	return language;
+	return &language;
 }
 
 
@@ -5407,7 +5842,7 @@ const TextEditor::Language& TextEditor::Language::C() {
 //	TextEditor::Language::Cpp
 //
 
-const TextEditor::Language& TextEditor::Language::Cpp() {
+const TextEditor::Language* TextEditor::Language::Cpp() {
 	static bool initialized = false;
 	static TextEditor::Language language;
 
@@ -5447,7 +5882,7 @@ const TextEditor::Language& TextEditor::Language::Cpp() {
 		initialized = true;
 	}
 
-	return language;
+	return &language;
 }
 
 
@@ -5987,7 +6422,7 @@ yy49:
 //	TextEditor::Language::Cs
 //
 
-const TextEditor::Language& TextEditor::Language::Cs() {
+const TextEditor::Language* TextEditor::Language::Cs() {
 	static bool initialized = false;
 	static TextEditor::Language language;
 
@@ -6019,7 +6454,7 @@ const TextEditor::Language& TextEditor::Language::Cs() {
 		initialized = true;
 	}
 
-	return language;
+	return &language;
 }
 
 
@@ -6027,7 +6462,7 @@ const TextEditor::Language& TextEditor::Language::Cs() {
 //	TextEditor::Language::AngelScript
 //
 
-const TextEditor::Language& TextEditor::Language::AngelScript() {
+const TextEditor::Language* TextEditor::Language::AngelScript() {
 	static bool initialized = false;
 	static TextEditor::Language language;
 
@@ -6047,7 +6482,7 @@ const TextEditor::Language& TextEditor::Language::AngelScript() {
 			"if", "import", "in", "inout", "int", "interface", "int8", "int16", "int32", "int64", "is", "mixin",
 			"namespace", "not", "null", "or", "out", "override", "private", "protected", "return", "set", "shared",
 			"super", "switch", "this ", "true", "typedef", "uint", "uint8", "uint16", "uint32", "uint64", "void",
-			"while", "xor", "foreach"
+			"while", "xor", "foreach", "nodiscard"
 		};
 
 		for (auto& keyword : keywords) { language.keywords.insert(keyword); }
@@ -6058,7 +6493,7 @@ const TextEditor::Language& TextEditor::Language::AngelScript() {
 		initialized = true;
 	}
 
-	return language;
+	return &language;
 }
 
 
@@ -6346,7 +6781,7 @@ static bool isLuaStylePunctuation(ImWchar character) {
 //	TextEditor::Language::Lua
 //
 
-const TextEditor::Language& TextEditor::Language::Lua() {
+const TextEditor::Language* TextEditor::Language::Lua() {
 	static bool initialized = false;
 	static TextEditor::Language language;
 
@@ -6368,13 +6803,13 @@ const TextEditor::Language& TextEditor::Language::Lua() {
 
 		for (auto& keyword : keywords) { language.keywords.insert(keyword); }
 
-		language.isPunctuation = isCStylePunctuation;
+		language.isPunctuation = isLuaStylePunctuation;
 		language.getIdentifier = getCStyleIdentifier;
 		language.getNumber = getLuaStyleNumber;
 		initialized = true;
 	}
 
-	return language;
+	return &language;
 }
 
 
@@ -6650,7 +7085,7 @@ yy18:
 //	TextEditor::Language::Python
 //
 
-const TextEditor::Language& TextEditor::Language::Python() {
+const TextEditor::Language* TextEditor::Language::Python() {
 	static bool initialized = false;
 	static TextEditor::Language language;
 
@@ -6680,7 +7115,7 @@ const TextEditor::Language& TextEditor::Language::Python() {
 		initialized = true;
 	}
 
-	return language;
+	return &language;
 }
 
 
@@ -6688,7 +7123,7 @@ const TextEditor::Language& TextEditor::Language::Python() {
 //	TextEditor::Language::Glsl
 //
 
-const TextEditor::Language& TextEditor::Language::Glsl() {
+const TextEditor::Language* TextEditor::Language::Glsl() {
 	static bool initialized = false;
 	static TextEditor::Language language;
 
@@ -6734,7 +7169,7 @@ const TextEditor::Language& TextEditor::Language::Glsl() {
 		initialized = true;
 	}
 
-	return language;
+	return &language;
 }
 
 
@@ -6742,7 +7177,7 @@ const TextEditor::Language& TextEditor::Language::Glsl() {
 //	TextEditor::Language::Hlsl
 //
 
-const TextEditor::Language& TextEditor::Language::Hlsl() {
+const TextEditor::Language* TextEditor::Language::Hlsl() {
 	static bool initialized = false;
 	static TextEditor::Language language;
 
@@ -6791,7 +7226,7 @@ const TextEditor::Language& TextEditor::Language::Hlsl() {
 		initialized = true;
 	}
 
-	return language;
+	return &language;
 }
 
 
@@ -7072,7 +7507,7 @@ yy24:
 //	TextEditor::Language::Json
 //
 
-const TextEditor::Language &TextEditor::Language::Json() {
+const TextEditor::Language* TextEditor::Language::Json() {
 	static bool initialized = false;
 	static TextEditor::Language language;
 
@@ -7091,7 +7526,7 @@ const TextEditor::Language &TextEditor::Language::Json() {
 		initialized = true;
 	}
 
-	return language;
+	return &language;
 }
 
 
@@ -7512,7 +7947,7 @@ yy37:
 //	TextEditor::Language::Markdown
 //
 
-const TextEditor::Language& TextEditor::Language::Markdown() {
+const TextEditor::Language* TextEditor::Language::Markdown() {
 	static bool initialized = false;
 	static TextEditor::Language language;
 
@@ -7525,5 +7960,5 @@ const TextEditor::Language& TextEditor::Language::Markdown() {
 		initialized = true;
 	}
 
-	return language;
+	return &language;
 }

@@ -59,7 +59,6 @@ protected:
     int selected_context = 0;
     int selected_stack_entry = 0;
     std::string_view selected_stack_section;
-    int update_cursor = 0;
     int update_row = 0;
 
     bool setupDock = true;
