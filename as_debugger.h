@@ -283,6 +283,14 @@ public:
 
     // Register an evaluator.
     void Register(int typeId, std::unique_ptr<asIDBTypeEvaluator> evaluator);
+
+    // A quick shortcut to make a templated instanation
+    // of T from the given type name.
+    template<typename T>
+    void Register(asIScriptEngine *engine, const char *name)
+    {
+        Register(engine->GetTypeInfoByName(name)->GetTypeId(), std::make_unique<T>());
+    }
 };
 
 // this class holds the cached state of stuff

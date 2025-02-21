@@ -220,7 +220,7 @@ bool asIDBVarView::operator==(const asIDBVarView &other) const
 
         asIDBTypeId typeKey { typeId, modifiers };
 
-        std::string localName = (name && *name) ? name : fmt::format("& {}", stackOffset);
+        std::string localName = (name && *name) ? fmt::format("name (&{})", n) : fmt::format("&{}", n);
 
         const std::string_view viewType = GetTypeNameFromType(typeKey);
 
@@ -236,7 +236,7 @@ bool asIDBVarView::operator==(const asIDBVarView &other) const
             state.value = evaluators.Evaluate(*this, idKey);
         }
 
-        map.push_back(asIDBVarView { localName, viewType, stateIt });
+        map.push_back(asIDBVarView { std::move(localName), viewType, stateIt });
     }
 }
 
@@ -252,13 +252,15 @@ public:
     virtual asIDBVarValue Evaluate(asIDBCache &, asIDBVarAddr id) const override { return { "(uninit)", true }; }
 };
 
+#include <array>
+
 class asIDBEnumTypeEvaluator : public asIDBTypeEvaluator
 {
 public:
     virtual asIDBVarValue Evaluate(asIDBCache &cache, asIDBVarAddr id) const override
     {
         // for enums where we have a single matched value
-        // just display it directly
+        // just display it directly; it might be a mask but that's OK.
         auto type = cache.ctx->GetEngine()->GetTypeInfoById(id.typeId);
         int v = *reinterpret_cast<const int32_t *>(id.address);
 
@@ -285,6 +287,9 @@ public:
         int v = *reinterpret_cast<const int32_t *>(id.address);
 
         state.entries.push_back({ fmt::format("value: {}", v) });
+        
+        // find bit names
+        std::array<const char *, 32> bit_names { };
 
         for (asUINT e = 0; e < type->GetEnumValueCount(); e++)
         {
@@ -297,7 +302,32 @@ public:
                 continue;
 
             if (ov & v)
-                state.entries.push_back({ name });
+            {
+                int p = 0;
+
+                while (ov && !(ov & 1))
+                {
+                    ov >>= 1;
+                    p++;
+                }
+
+                // only take the first name, just incase
+                // there's later overrides
+                if (p <= 31 && !bit_names[p])
+                    bit_names[p] = name;
+            }
+        }
+
+        // display bits
+        for (asUINT e = 0; e < bit_names.size(); e++)
+        {
+            if (v & (1 << e))
+            {
+                if (bit_names[e])
+                    state.entries.push_back({ fmt::format("[{:2}] {}", e, bit_names[e]) });
+                else
+                    state.entries.push_back({ fmt::format("[{:2}] {}", e, 1 << e) });
+            }
         }
     }
 };
