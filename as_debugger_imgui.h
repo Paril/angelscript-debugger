@@ -43,16 +43,19 @@ public:
     bool Render(bool full);
 
     // window renderings
-    void RenderVariableTable(const char *label, const char *filter, asIDBVarViewVector &vars, bool in_watch);
+    void RenderVariableTable(const char *label, std::function<void()> render_variables);
     void RenderLocals(const char *filter, asIDBLocalKey stack_entry);
-    void RenderGlobals(const char *filter);
+    void RenderGlobals(const char *filter, bool showConstants, bool showNamespaced);
     void RenderWatch();
 
     virtual void SetWindowVisibility(bool visible) = 0;
+    bool IsWindowVisible() { return isVisible; }
 
 protected:
     bool show_demo_window = true;
     bool show_another_window = false;
+    bool isVisible = true, wasVisible = false;
+    bool showExceptionWindow = true;
     ImVec4 clear_color = ImVec4(0.45f, 0.55f, 0.60f, 1.00f);
     TextEditor editor;
 
@@ -68,11 +71,7 @@ protected:
     bool resetOpenStates = false;
 
     // renders a single debugger variable
-    void RenderDebuggerVariable(asIDBVarView &varView, const char *filter, bool in_watch);
-
-    // get the source code for the given section
-    // of the given module.
-    virtual std::string FetchSource(asIScriptModule *module, const char *section) = 0;
+    bool RenderDebuggerVariable(asIDBVarViewBase &varView, const char *filter);
 
     // Setup the backend for ImGui.
     virtual void SetupImGuiBackend() = 0;

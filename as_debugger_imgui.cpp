@@ -61,8 +61,10 @@ void asIDBImGuiFrontend::SetupImGui()
                 ImDrawFlags_RoundCornersAll, 1.5);
         }
     });
+    // TODO: text callback for watch/breakpoints
 
-    ChangeScript();
+    if (debugger->cache)
+        ChangeScript();
 }
 
 // script changed, so clear stuff that
@@ -73,17 +75,34 @@ void asIDBImGuiFrontend::ChangeScript()
     editor.ClearMarkers();
 
     asIScriptContext *ctx = debugger->cache->ctx;
+    
+    asIScriptFunction *func = nullptr;
+    int col = 0;
+    const char *sec = nullptr;
 
-    auto func = ctx->GetFunction(selected_stack_entry);
-    int col;
-    const char *sec;
-    update_row = ctx->GetLineNumber(selected_stack_entry, &col, &sec);
+    if (ctx->GetState() == asEXECUTION_EXCEPTION && selected_stack_entry == 0)
+    {
+        func = ctx->GetExceptionFunction();
+
+        if (func)
+            update_row = ctx->GetExceptionLineNumber(&col, &sec);
+    }
+    else
+    {
+        func = ctx->GetFunction(selected_stack_entry);
+
+        if (func)
+            update_row = ctx->GetLineNumber(selected_stack_entry, &col, &sec);
+    }
+
+    if (!func)
+        return;
 
     if (selected_stack_section != sec)
     {
         selected_stack_section = sec;
 
-        auto file = FetchSource(func->GetModule(), sec);
+        auto file = debugger->FetchSource(sec);
         editor.SetText(file);
     }
 
@@ -124,6 +143,7 @@ bool asIDBImGuiFrontend::Render(bool full)
             ImGui::DockBuilderSplitNode(dockspace_id, ImGuiDir_Down, 0.20f, &dock_id_down, &dock_id_top);
             ImGui::DockBuilderDockWindow("Call Stack", dock_id_down);
             ImGui::DockBuilderDockWindow("Breakpoints", dock_id_down);
+            ImGui::DockBuilderDockWindow("Exception", dock_id_down);
 
             {
                 ImGuiID dock_id_left = 0, dock_id_right = 0;
@@ -162,14 +182,21 @@ bool asIDBImGuiFrontend::Render(bool full)
 
     if (show)
     {
-        if (!full)
+        this->debugger->mutex.lock();
+
+        auto *cache = this->debugger->cache.get();
+
+        asIScriptContext *ctx = cache ? cache->ctx : nullptr;
+        bool isException = ctx ? (ctx->GetState() == asEXECUTION_EXCEPTION) : false;
+
+        if (!full || isException)
             ImGui::PushItemFlag(ImGuiItemFlags_Disabled, true);
 
         if (ImGui::BeginMainMenuBar())
         {
             if (ImGui::MenuItem("Continue"))
             {
-                debugger->Resume();
+                debugger->Continue();
             }
             else if (ImGui::MenuItem("Step Into"))
             {
@@ -192,25 +219,28 @@ bool asIDBImGuiFrontend::Render(bool full)
             ImGui::EndMainMenuBar();
         }
 
-        auto &cache = this->debugger->cache;
-        auto ctx = cache->ctx;
+        if (full && isException)
+            ImGui::PopItemFlag();
 
         if (ImGui::Begin("Call Stack", nullptr, ImGuiWindowFlags_HorizontalScrollbar))
         {
-            if (!cache->system_function.empty())
-                ImGui::Selectable(cache->system_function.c_str(), false, ImGuiSelectableFlags_Disabled);
-
-            int n = 0;
-            for (auto &stack : cache->call_stack)
+            if (cache)
             {
-                bool sel = selected_stack_entry == n;
-                if (ImGui::Selectable(stack.declaration.c_str(), &sel))
-                {
-                    selected_stack_entry = n;
-                    resetText = true;
-                }
+                if (!cache->system_function.empty())
+                    ImGui::Selectable(cache->system_function.c_str(), false, ImGuiSelectableFlags_Disabled);
 
-                n++;
+                int n = 0;
+                for (auto &stack : cache->call_stack)
+                {
+                    bool sel = selected_stack_entry == n;
+                    if (ImGui::Selectable(stack.declaration.c_str(), &sel))
+                    {
+                        selected_stack_entry = n;
+                        resetText = true;
+                    }
+
+                    n++;
+                }
             }
         }
         ImGui::End();
@@ -257,6 +287,15 @@ bool asIDBImGuiFrontend::Render(bool full)
         }
         ImGui::End();
 
+        if (isException)
+        {
+            if (ImGui::Begin("Exception", nullptr, ImGuiWindowFlags_HorizontalScrollbar))
+            {
+                ImGui::TextWrapped("%s", ctx->GetExceptionString());
+            }
+            ImGui::End();
+        }
+
         if (!full)
             ImGui::PushItemFlag(ImGuiItemFlags_Disabled, true);
 
@@ -266,7 +305,8 @@ bool asIDBImGuiFrontend::Render(bool full)
 
             static char filterBuf[64] {};
             ImGui::InputText("##Filter", filterBuf, sizeof(filterBuf));
-            RenderLocals(filterBuf, asIDBLocalKey(selected_stack_entry, asIDBLocalType::Parameter));
+            if (cache)
+                RenderLocals(filterBuf, asIDBLocalKey(selected_stack_entry, asIDBLocalType::Parameter));
             ImGui::PopItemWidth();
         }
         ImGui::End();
@@ -275,9 +315,10 @@ bool asIDBImGuiFrontend::Render(bool full)
         {
             ImGui::PushItemWidth(-1);
 
-            static char filterBuf[64] {};
+            static char filterBuf[256] {};
             ImGui::InputText("##Filter", filterBuf, sizeof(filterBuf));
-            RenderLocals(filterBuf, asIDBLocalKey(selected_stack_entry, asIDBLocalType::Variable));
+            if (cache)
+                RenderLocals(filterBuf, asIDBLocalKey(selected_stack_entry, asIDBLocalType::Variable));
             ImGui::PopItemWidth();
         }
         ImGui::End();
@@ -286,43 +327,103 @@ bool asIDBImGuiFrontend::Render(bool full)
         {
             ImGui::PushItemWidth(-1);
 
-            static char filterBuf[64] {};
+            static char filterBuf[256] {};
             ImGui::InputText("##Filter", filterBuf, sizeof(filterBuf));
-            RenderLocals(filterBuf, asIDBLocalKey(selected_stack_entry, asIDBLocalType::Temporary));
+            if (cache)
+                RenderLocals(filterBuf, asIDBLocalKey(selected_stack_entry, asIDBLocalType::Temporary));
             ImGui::PopItemWidth();
         }
         ImGui::End();
         
         if (ImGui::Begin("Globals"))
         {
-            ImGui::PushItemWidth(-1);
-
-            static char filterBuf[64] {};
-            ImGui::InputText("##Filter", filterBuf, sizeof(filterBuf));
-            RenderGlobals(filterBuf);
+            static char filterBuf[256] {};
+            static bool showConstants = false, showNamespaced = false;
+            
+            ImGui::PushItemWidth(ImGui::GetContentRegionAvail().x - ImGui::CalcTextSize("Filter").x);
+            ImGui::InputText("Filter", filterBuf, sizeof(filterBuf));
             ImGui::PopItemWidth();
+            
+            ImGui::Checkbox("Show Constants", &showConstants);
+            ImGui::SameLine();
+            ImGui::Checkbox("Show Namespaced", &showNamespaced);
+            
+            ImGui::PushItemWidth(-1);
+            if (cache)
+                RenderGlobals(filterBuf, showConstants, showNamespaced);
+            ImGui::PopItemWidth();
+
         }
         ImGui::End();
         
         if (ImGui::Begin("Watch"))
         {
             ImGui::PushItemWidth(-1);
-            RenderWatch();
+            if (cache)
+                RenderWatch();
             ImGui::PopItemWidth();
         }
         ImGui::End();
 
-        if (ImGui::Begin("Sections", nullptr, ImGuiWindowFlags_HorizontalScrollbar))
-            for (auto &section : cache->sections)
-                ImGui::Selectable(section.second.data(), false);
-        ImGui::End();
-
         if (!full)
             ImGui::PopItemFlag();
+
+        std::string_view change_section;
+
+        if (ImGui::Begin("Sections", nullptr, ImGuiWindowFlags_HorizontalScrollbar))
+        {
+            for (auto &section : debugger->sections)
+            {
+                if (ImGui::Selectable(section.second.data(), selected_stack_section == section.first))
+                    change_section = section.first;
+            }
+        }
+        ImGui::End();
         
         if (ImGui::Begin("Source"))
             editor.Render("Source", ImVec2(-1, -1));
         ImGui::End();
+
+        if (isException)
+        {
+            if (showExceptionWindow)
+            {
+                showExceptionWindow = false;
+                ImGui::OpenPopup("Exception Thrown");
+                ImGui::SetNextWindowPos(viewport->GetCenter(), ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
+                ImGui::SetNextWindowSize(ImVec2(300, -1));
+            }
+
+            if (ImGui::BeginPopupModal("Exception Thrown"))
+            {
+                ImGui::TextWrapped("An exception was thrown:");
+                ImGui::BulletText(ctx->GetExceptionString());
+                ImGui::TextWrapped("Note that the debugger is in a state that does not allow re-execution - some features are unavailable.");
+
+                if (ImGui::Button("OK", ImVec2(70, 20)))
+                {
+                    editor.ScrollToLine(update_row - 1, TextEditor::Scroll::alignMiddle);
+                    ImGui::CloseCurrentPopup();
+                }
+
+                ImGui::EndPopup();
+            }
+        }
+
+        if (!change_section.empty())
+        {
+            if (selected_stack_section != change_section)
+            {
+                selected_stack_section = change_section;
+
+                auto file = debugger->FetchSource(selected_stack_section.data());
+                editor.SetText(file);
+
+                resetOpenStates = true;
+            }
+        }
+
+        this->debugger->mutex.unlock();
     }
     
     ImGui::End();
@@ -339,13 +440,15 @@ bool asIDBImGuiFrontend::Render(bool full)
     if (full)
     {
         if (ImGui::IsKeyPressed(ImGuiKey::ImGuiKey_F5, false))
-            debugger->Resume();
+            debugger->Continue();
         else if (ImGui::IsKeyPressed(ImGuiKey::ImGuiKey_F10))
             debugger->StepOver();
         else if (ImGui::IsKeyPressed(ImGuiKey::ImGuiKey_F11) && (mods & ImGuiKey::ImGuiMod_Shift) == 0)
             debugger->StepInto();
         else if (ImGui::IsKeyPressed(ImGuiKey::ImGuiKey_F11) && (mods & ImGuiKey::ImGuiMod_Shift) == ImGuiKey::ImGuiMod_Shift)
             debugger->StepOut();
+
+        wasVisible = true;
     }
 
     if (ImGui::IsKeyPressed(ImGuiKey::ImGuiKey_F9, false))
@@ -358,7 +461,7 @@ bool asIDBImGuiFrontend::Render(bool full)
     return true;
 }
 
-void asIDBImGuiFrontend::RenderVariableTable(const char *label, const char *filter, asIDBVarViewVector &vars, bool in_watch)
+void asIDBImGuiFrontend::RenderVariableTable(const char *label, std::function<void()> render_variables)
 {
     if (ImGui::BeginTable(label, 3,
         ImGuiTableFlags_BordersV | ImGuiTableFlags_BordersOuterH |
@@ -369,14 +472,8 @@ void asIDBImGuiFrontend::RenderVariableTable(const char *label, const char *filt
         ImGui::TableSetupColumn("Value", ImGuiTableColumnFlags_WidthStretch);
         ImGui::TableSetupColumn("Type", ImGuiTableColumnFlags_WidthStretch);
         ImGui::TableHeadersRow();
-            
-        for (int n = 0; n < vars.size(); n++)
-        {
-            ImGui::PushID(n);
-            auto global = vars[n];
-            RenderDebuggerVariable(global, filter, in_watch);
-            ImGui::PopID();
-        }
+
+        render_variables();
 
         ImGui::EndTable();
     }
@@ -391,10 +488,18 @@ void asIDBImGuiFrontend::RenderLocals(const char *filter, asIDBLocalKey stack_en
 
     auto &f = cache->locals.find(stack_entry)->second;
 
-    RenderVariableTable("##Locals", filter, f, false);
+    RenderVariableTable("##Locals", [&]() {
+        for (int n = 0; n < f.size(); n++)
+        {
+            ImGui::PushID(n);
+            auto &local = f[n];
+            RenderDebuggerVariable(local, filter);
+            ImGui::PopID();
+        }
+    });
 }
 
-void asIDBImGuiFrontend::RenderGlobals(const char *filter)
+void asIDBImGuiFrontend::RenderGlobals(const char *filter, bool showConstants, bool showNamespaced)
 {
     asIDBCache *cache = debugger->cache.get();
 
@@ -402,124 +507,179 @@ void asIDBImGuiFrontend::RenderGlobals(const char *filter)
         cache->CacheGlobals();
 
     auto &f = cache->globals;
+    
+    RenderVariableTable("##Globals", [&]() {
+        for (int n = 0; n < f.size(); n++)
+        {
+            auto &global = f[n];
 
-    RenderVariableTable("##Globals", filter, f, false);
+            if (!showConstants && global.var->first.constant)
+                continue;
+            else if (!showNamespaced && global.name.find_first_of(':') != std::string_view::npos)
+                continue;
+
+            ImGui::PushID(n);
+            RenderDebuggerVariable(global, filter);
+            ImGui::PopID();
+        }
+    });
 }
 
 void asIDBImGuiFrontend::RenderWatch()
 {
     asIDBCache *cache = debugger->cache.get();
     auto &f = cache->watch;
+    std::optional<ptrdiff_t> removeFromWatch;
 
-    RenderVariableTable("##Globals", nullptr, f, true);
+    RenderVariableTable("##Watch", [&]() {
+        for (int n = 0; n < f.size(); n++)
+        {
+            ImGui::PushID(n);
+            auto &val = f[n];
 
-    if (cache->removeFromWatch != f.end())
+            if (val.dirty)
+            {
+                val.result = cache->ResolveExpression(val.name, selected_stack_entry);
+
+                // TODO: modifier passed through resolve expression?
+                if (val.result)
+                    val.type = cache->GetTypeNameFromType({ val.result->idKey.typeId });
+                else
+                    val.type = "";
+
+                val.dirty = false;
+            }
+
+            bool right_clicked = RenderDebuggerVariable(val, nullptr);
+
+            if (right_clicked)
+            {
+                removeFromWatch = n;
+            }
+
+            ImGui::PopID();
+        }
+    });
+
+    if (removeFromWatch)
+        f.erase(f.begin() + *removeFromWatch);
+
+    static char buf[128];
+    ImGui::InputTextWithHint("##AddToWatch", "Expression...", buf, sizeof(buf));
+
+    if (ImGui::IsItemDeactivatedAfterEdit())
     {
-        cache->watch.erase(cache->removeFromWatch);
-        cache->removeFromWatch = f.end();
+        cache->watch.emplace_back(buf);
+        buf[0] = '\0';
     }
 }
 
-void asIDBImGuiFrontend::RenderDebuggerVariable(asIDBVarView &varView, const char *filter, bool in_watch)
+bool asIDBImGuiFrontend::RenderDebuggerVariable(asIDBVarViewBase &varView, const char *filter)
 {
     asIDBCache *cache = debugger->cache.get();
-    auto varIt = varView.var;
-    auto &var = varIt->second;
 
     int opened = ImGui::GetStateStorage()->GetInt(ImGui::GetID(varView.name.data(), varView.name.data() + varView.name.size()), 0);
                     
     if (!opened && filter && *filter && varView.name.find(filter) == std::string::npos)
-        return;
+        return false;
         
     ImGui::PushID(varView.name.data(), varView.name.data() + varView.name.size());
 
     ImGui::TableNextRow();
     ImGui::TableNextColumn();
-    bool open = ImGui::TreeNodeEx(varView.name.data(), ImGuiTreeNodeFlags_SpanAllColumns | (var.value.expandable == asIDBExpandType::None ? ImGuiTreeNodeFlags_Leaf : ImGuiTreeNodeFlags_None));
+    bool open = ImGui::TreeNodeEx(varView.name.data(), ImGuiTreeNodeFlags_SpanAllColumns | ((!varView.IsValid() || varView.GetState().value.expandable == asIDBExpandType::None) ? ImGuiTreeNodeFlags_Leaf : ImGuiTreeNodeFlags_None));
+    bool remove = false;
 
     if (ImGui::IsItemClicked(ImGuiMouseButton_Right))
-    {
-        if (in_watch)
-            cache->removeFromWatch = std::find(cache->watch.begin(), cache->watch.end(), varView);
-
-        if (cache->removeFromWatch == cache->watch.end())
-        {
-            cache->watch.push_back(varView);
-            cache->removeFromWatch = cache->watch.end();
-        }
-    }
+        remove = true;
 
     ImGui::TableNextColumn();
-
-    if (open)
+    
+    if (!varView.IsValid())
     {
-        if ((var.value.expandable == asIDBExpandType::Children ||
-             var.value.expandable == asIDBExpandType::Entries) && !var.queriedChildren)
-        {
-            cache->evaluators.Expand(*cache, varIt->first, varIt->second);
-            var.queriedChildren = true;
-        }
+        ImGui::TextDisabled("invalid expression");
+        ImGui::TableNextColumn();
+
+        if (open)
+            ImGui::TreePop();
     }
-
-    if (!var.value.value.empty())
+    else
     {
-        if (var.value.disabled)
-            ImGui::BeginDisabled(true);
-        auto s = var.value.value.substr(0, 32);
-        ImGui::TextUnformatted(s.data(), s.data() + s.size());
-        if (var.value.disabled)
-            ImGui::EndDisabled();
-    }
-    ImGui::TableNextColumn();
-    ImGui::TextUnformatted(varView.type.data(), varView.type.data() + varView.type.size());
+        auto varId = varView.GetID();
+        auto &var = varView.GetState();
 
-    if (open)
-    {
-        if (var.value.expandable == asIDBExpandType::Children)
+        if (open)
         {
-            int i = 0;
-
-            for (auto &child : var.children)
+            if ((var.value.expandable == asIDBExpandType::Children ||
+                 var.value.expandable == asIDBExpandType::Entries) && !var.queriedChildren)
             {
-                ImGui::PushID(i);
-                RenderDebuggerVariable(child, filter, in_watch);
-                ImGui::PopID();
-
-                i++;
+                cache->evaluators.Expand(*cache, varId, var);
+                var.queriedChildren = true;
             }
         }
-        else if (var.value.expandable == asIDBExpandType::Value ||
-                 var.value.expandable == asIDBExpandType::Entries)
+
+        if (!var.value.value.empty())
         {
-            // FIXME: how to make this span the entire column?
-            // any samples I could find don't deal with long text.
-            // I guess we could have a separate "value viewer" tab that
-            // can be used if you click a button on an entry or something.
-            // Sort of like Watch but specifically for values.
+            if (var.value.disabled)
+                ImGui::BeginDisabled(true);
+            auto s = var.value.value.substr(0, 32);
+            ImGui::TextUnformatted(s.data(), s.data() + s.size());
+            if (var.value.disabled)
+                ImGui::EndDisabled();
+        }
+        ImGui::TableNextColumn();
+        ImGui::TextUnformatted(varView.type.data(), varView.type.data() + varView.type.size());
 
-            ImGui::TableNextRow();
-            ImGui::TableNextColumn();
-            ImGui::PushTextWrapPos(0.0f);
+        if (open)
+        {
+            if (var.value.expandable == asIDBExpandType::Children)
+            {
+                int i = 0;
 
-            if (var.value.expandable == asIDBExpandType::Value)
-            {
-                const std::string_view s = var.value.value;
-                ImGui::TextUnformatted(s.data(), s.data() + s.size());
-            }
-            else
-            {
-                for (auto &entry : var.entries)
+                for (auto &child : var.children)
                 {
-                    ImGui::Bullet();
-                    ImGui::SameLine();
-                    ImGui::TextUnformatted(entry.value.data(), entry.value.data() + entry.value.size());
+                    ImGui::PushID(i);
+                    RenderDebuggerVariable(child, filter);
+                    ImGui::PopID();
+
+                    i++;
                 }
             }
+            else if (var.value.expandable == asIDBExpandType::Value ||
+                     var.value.expandable == asIDBExpandType::Entries)
+            {
+                // FIXME: how to make this span the entire column?
+                // any samples I could find don't deal with long text.
+                // I guess we could have a separate "value viewer" tab that
+                // can be used if you click a button on an entry or something.
+                // Sort of like Watch but specifically for values.
 
-            ImGui::PopTextWrapPos();
+                ImGui::TableNextRow();
+                ImGui::TableNextColumn();
+                ImGui::PushTextWrapPos(0.0f);
+
+                if (var.value.expandable == asIDBExpandType::Value)
+                {
+                    const std::string_view s = var.value.value;
+                    ImGui::TextUnformatted(s.data(), s.data() + s.size());
+                }
+                else
+                {
+                    for (auto &entry : var.entries)
+                    {
+                        ImGui::Bullet();
+                        ImGui::SameLine();
+                        ImGui::TextUnformatted(entry.value.data(), entry.value.data() + entry.value.size());
+                    }
+                }
+
+                ImGui::PopTextWrapPos();
+            }
+            ImGui::TreePop();
         }
-        ImGui::TreePop();
     }
 
     ImGui::PopID();
+
+    return remove;
 }

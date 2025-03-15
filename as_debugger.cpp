@@ -6,23 +6,18 @@
 #include "as_debugger.h"
 #include <bitset>
 
-bool asIDBVarView::operator==(const asIDBVarView &other) const
+/*virtual*/ const asIDBVarAddr &asIDBVarView::GetID() /*override*/
 {
-    return name == other.name && type == other.type && var == other.var;
+    return var->first;
+}
+
+/*virtual*/ asIDBVarState &asIDBVarView::GetState() /*override*/
+{
+    return var->second;
 }
 
 /*virtual*/ void asIDBCache::Refresh()
 {
-    CacheCallstack();
-
-    // TODO: this is ugly, we shouldn't need to wipe
-    // the whole cache on refreshes. this also makes
-    // watch kinda useless.
-    locals.clear();
-    globals.clear();
-    globalsCached = false;
-    watch.clear();
-    var_states.clear();
 }
 
 /*virtual*/ const std::string_view asIDBCache::GetTypeNameFromType(asIDBTypeId id)
@@ -66,25 +61,213 @@ bool asIDBVarView::operator==(const asIDBVarView &other) const
     return type_names.emplace(id, std::move(name)).first->second;
 }
 
-/*virtual*/ void asIDBCache::CacheSections()
+void *asIDBCache::ResolvePropertyAddress(const asIDBResolvedVarAddr &id, int propertyIndex, int offset, int compositeOffset, bool isCompositeIndirect)
 {
-    auto main = ctx->GetFunction(0)->GetModule();
-
-    for (asUINT n = 0; n < main->GetFunctionCount(); n++)
+    if (id.source.typeId & asTYPEID_SCRIPTOBJECT)
     {
-        const char *section = nullptr;
-        main->GetFunctionByIndex(n)->GetDeclaredAt(&section, nullptr, nullptr);
-        EnsureSectionCached(section);
+        asIScriptObject *obj = (asIScriptObject *) id.resolved;
+        return obj->GetAddressOfProperty(propertyIndex);
     }
+
+    // indirect changes our ptr to
+    // *(object + compositeOffset) + offset
+    if (isCompositeIndirect)
+    {
+        void *propAddr = *reinterpret_cast<uint8_t **>(reinterpret_cast<uint8_t *>(id.resolved) + compositeOffset);
+
+        // if we're null, leave it alone, otherwise point to
+        // where we really need to be pointing
+        if (propAddr)
+            propAddr = reinterpret_cast<uint8_t *>(propAddr) + offset;
+
+        return propAddr;
+    }
+
+    return reinterpret_cast<uint8_t *>(id.resolved) + offset + compositeOffset;
 }
 
-/*virtual*/ void asIDBCache::EnsureSectionCached(std::string_view section)
+#include <charconv>
+
+/*virtual*/ std::optional<asIDBExprResult> asIDBCache::ResolveExpression(const std::string_view expr, int stack_index)
 {
-    sections.insert({ section, section });
+    // isolate the variable name first
+    std::string_view variable_name = expr.substr(0, expr.find_first_of(".[", 0));
+    asIDBVarAddr variable_key;
+
+    // if it starts with a & it has to be a local variable index
+    if (variable_name[0] == '&')
+    {
+        uint16_t offset;
+        auto result = std::from_chars(&variable_name.front(), &variable_name.front() + variable_name.size(), offset);
+
+        if (result.ec != std::errc())
+            return std::nullopt;
+
+        // check bounds
+        int m = ctx->GetVarCount(stack_index);
+
+        if (offset >= m)
+            return std::nullopt;
+
+        if (!ctx->IsVarInScope(offset, stack_index))
+            return std::nullopt;
+
+        // grab key
+        asETypeModifiers modifiers;
+        ctx->GetVar(offset, stack_index, 0, &variable_key.typeId, &modifiers);
+        variable_key.constant = (modifiers & asTM_CONST) != 0;
+        variable_key.address = ctx->GetAddressOfVar(offset, stack_index);
+    }
+    // check this
+    else if (variable_name == "this")
+    {
+        if (!(variable_key.address = ctx->GetThisPointer(stack_index)))
+            return std::nullopt;
+
+        variable_key.typeId = ctx->GetThisTypeId(stack_index);
+    }
+    else
+    {
+        // not an offset; in order, check the following:
+        // - local variables (in reverse order)
+        // - function parameters
+        // - class member properties (if appropriate)
+        // - globals
+        for (int i = ctx->GetVarCount(stack_index) - 1; i >= 0; i--)
+        {
+            if (!ctx->IsVarInScope(i, stack_index))
+                continue;
+
+            const char *name;
+            int typeId;
+            ctx->GetVar(i, stack_index, &name, &typeId);
+
+            if (variable_name != name)
+                continue;
+
+            variable_key.typeId = typeId;
+            variable_key.address = ctx->GetAddressOfVar(i, stack_index);
+            break;
+        }
+
+        // check `this` parameters
+        if (!variable_key.typeId)
+        {
+            if (auto thisPtr = ctx->GetThisPointer(stack_index))
+            {
+                auto thisTypeId = ctx->GetThisTypeId(stack_index);
+                auto type = ctx->GetEngine()->GetTypeInfoById(thisTypeId);
+
+                for (asUINT i = 0; i < type->GetPropertyCount(); i++)
+                {
+                    const char *name;
+                    int typeId;
+                    int offset;
+                    int compositeOffset;
+                    bool isCompositeIndirect;
+                    bool isReadOnly;
+
+                    type->GetProperty(i, &name, &typeId, 0, 0, &offset, 0, 0, &compositeOffset, &isCompositeIndirect, &isReadOnly);
+
+                    if (variable_name != name)
+                        continue;
+
+                    variable_key.typeId = typeId;
+                    variable_key.constant = isReadOnly;
+                    variable_key.address = ResolvePropertyAddress(asIDBVarAddr { thisTypeId, false, thisPtr }, i, offset, compositeOffset, isCompositeIndirect);
+                    break;
+                }
+            }
+        }
+
+        // check globals
+        if (!variable_key.typeId)
+        {
+            auto main = ctx->GetFunction(0)->GetModule();
+
+            for (asUINT n = 0; n < main->GetGlobalVarCount(); n++)
+            {
+                const char *name;
+                int typeId;
+                bool isConst;
+
+                main->GetGlobalVar(n, &name, nullptr, &typeId, &isConst);
+
+                if (variable_name != name)
+                    continue;
+
+                variable_key.typeId = typeId;
+                variable_key.address = main->GetAddressOfGlobalVar(n);
+                break;
+            }
+        }
+
+        if (!variable_key.typeId)
+            return std::nullopt;
+    }
+
+    // variable_key should be non-null and with
+    // a valid type ID here.
+    return ResolveSubExpression(variable_key, expr.substr(variable_name.size()), stack_index);
+}
+
+/*virtual*/ std::optional<asIDBExprResult> asIDBCache::ResolveSubExpression(const asIDBResolvedVarAddr &idKey, const std::string_view rest, int stack_index)
+{
+    // nothing left, so this is the result.
+    if (rest.empty())
+        return asIDBExprResult { idKey.source, evaluators.Evaluate(*this, idKey) };
+
+    // make sure we're a type that supports properties
+    auto type = ctx->GetEngine()->GetTypeInfoById(idKey.source.typeId);
+
+    if (!type)
+        return std::nullopt;
+    else if (type->GetFlags() & (asOBJ_ENUM | asOBJ_FUNCDEF))
+        return std::nullopt;
+    // uninitialized, etc
+    else if (!idKey.resolved)
+        return std::nullopt;
+
+    // check what kind of sub-evaluator to use
+    std::string_view eval_name = rest.substr(0, rest.find_first_of(".[", 1));
+
+    if (eval_name[0] == '.')
+    {
+        std::string_view prop_name = eval_name.substr(1);
+
+        for (asUINT i = 0; i < type->GetPropertyCount(); i++)
+        {
+            const char *name;
+            int typeId;
+            int offset;
+            int compositeOffset;
+            bool isCompositeIndirect;
+            bool isReadOnly;
+
+            type->GetProperty(i, &name, &typeId, 0, 0, &offset, 0, 0, &compositeOffset, &isCompositeIndirect, &isReadOnly);
+
+            if (prop_name != name)
+                continue;
+
+            void *propAddr = ResolvePropertyAddress(idKey, i, offset, compositeOffset, isCompositeIndirect);
+
+            return ResolveSubExpression(asIDBVarAddr { typeId, isReadOnly, propAddr }, rest.substr(eval_name.size()), stack_index);
+        }
+    }
+    else if (eval_name[0] == '[')
+    {
+        // TODO
+        return std::nullopt;
+    }
+
+    return std::nullopt;
 }
 
 /*virtual*/ void asIDBCache::CacheCallstack()
 {
+    if (!ctx)
+        return;
+
     call_stack.clear();
 
     if (auto sysfunc = ctx->GetSystemFunction())
@@ -94,11 +277,31 @@ bool asIDBVarView::operator==(const asIDBVarView &other) const
 
     for (asUINT n = 0; n < ctx->GetCallstackSize(); n++)
     {
-        auto func = ctx->GetFunction(n);
-        int column;
-        const char *section;
-        int row = ctx->GetLineNumber(n, &column, &section);
-        std::string decl = fmt::format("{} Line {}", func->GetDeclaration(true, false, true), row);
+        asIScriptFunction *func = nullptr;
+        int column = 0;
+        const char *section = "";
+        int row = 0;
+
+        if (n == 0 && ctx->GetState() == asEXECUTION_EXCEPTION)
+        {
+            func = ctx->GetExceptionFunction();
+            if (func)
+                row = ctx->GetExceptionLineNumber(&column, &section);
+        }
+        else
+        {
+            func = ctx->GetFunction(n);
+
+            if (func)
+                row = ctx->GetLineNumber(n, &column, &section);
+        }
+
+        std::string decl;
+        
+        if (func)
+            decl = fmt::format("{} Line {}", func->GetDeclaration(true, false, true), row);
+        else
+            decl = "???";
 
         call_stack.push_back(asIDBCallStackEntry {
             std::move(decl),
@@ -107,28 +310,42 @@ bool asIDBVarView::operator==(const asIDBVarView &other) const
             column
         });
 
-        EnsureSectionCached(call_stack.back().section);
+        dbg->EnsureSectionCached(call_stack.back().section, call_stack.back().section);
     }
+}
+
+// restore data from the given cache that is
+// being replaced by this one.
+/*virtual*/ void asIDBCache::Restore(asIDBCache &cache)
+{
+    watch = std::move(cache.watch);
+
+    for (auto &w : watch)
+        w.dirty = true;
 }
 
 /*virtual*/ void asIDBCache::CacheGlobals()
 {
+    if (!ctx)
+        return;
+
     auto main = ctx->GetFunction(0)->GetModule();
 
     for (asUINT n = 0; n < main->GetGlobalVarCount(); n++)
     {
         const char *name;
+        const char *nameSpace;
         int typeId;
         void *ptr;
         bool isConst;
 
-        main->GetGlobalVar(n, &name, nullptr, &typeId, &isConst);
+        main->GetGlobalVar(n, &name, &nameSpace, &typeId, &isConst);
         ptr = main->GetAddressOfGlobalVar(n);
 
         asIDBTypeId typeKey { typeId, isConst ? asTM_CONST : asTM_NONE };
         const std::string_view viewType = GetTypeNameFromType(typeKey);
 
-        asIDBVarAddr idKey { typeId, ptr };
+        asIDBVarAddr idKey { typeId, isConst, ptr };
 
         // globals can safely appear in more than one spot
         bool exists;
@@ -140,7 +357,7 @@ bool asIDBVarView::operator==(const asIDBVarView &other) const
             state.value = evaluators.Evaluate(*this, idKey);
         }
 
-        globals.push_back(asIDBVarView { name, viewType, stateIt });
+        globals.push_back(asIDBVarView { (nameSpace && nameSpace[0]) ? fmt::format("{}::{}", nameSpace, name) : name, viewType, stateIt });
     }
 
     globalsCached = true;
@@ -148,65 +365,52 @@ bool asIDBVarView::operator==(const asIDBVarView &other) const
 
 /*virtual*/ void asIDBCache::CacheLocals(asIDBLocalKey stack_entry)
 {
+    if (!ctx)
+        return;
+
     // variables in AS are always ordered the same way it seems:
     // function parameters come first,
     // then local variables,
     // then temporaries used during calculations.
-    int numLocals = ctx->GetVarCount(stack_entry.offset);
     int numParams = ctx->GetFunction(stack_entry.offset)->GetParamCount();
-    int numTemporaries = 0;
-        
-    for (int s = numParams; s < numLocals; s++)
-    {
-        const char *name;
-        ctx->GetVar(s, stack_entry.offset, &name);
+    int numLocals = ctx->GetVarCount(stack_entry.offset);
 
-        if (!name || !*name)
-        {
-            numTemporaries = numLocals - s;
-            break;
-        }
-    }
-
-    int numVariables = numLocals - numParams - numTemporaries;
     int start = 0, end = 0;
 
     if (stack_entry.type == asIDBLocalType::Parameter)
         end = numParams;
-    else if (stack_entry.type == asIDBLocalType::Variable)
-    {
-        start = numParams;
-        end = numParams + numVariables;
-    }
     else
     {
-        start = numParams + numVariables;
+        start = numParams;
         end = numLocals;
     }
 
     auto &map = locals[stack_entry];
 
-    if (auto thisPtr = ctx->GetThisPointer(stack_entry.offset))
+    if (stack_entry.type == asIDBLocalType::Variable)
     {
-        int thisTypeId = ctx->GetThisTypeId(stack_entry.offset);
-
-        asIDBTypeId typeKey { thisTypeId, asTM_NONE };
-
-        const std::string_view viewType = GetTypeNameFromType(typeKey);
-
-        asIDBVarAddr idKey { thisTypeId, thisPtr };
-
-        // locals can safely appear in more than one spot
-        bool exists;
-        auto stateIt = AddVarState(idKey, exists);
-
-        if (!exists)
+        if (auto thisPtr = ctx->GetThisPointer(stack_entry.offset))
         {
-            auto &state = stateIt->second;
-            state.value = evaluators.Evaluate(*this, idKey);
-        }
+            int thisTypeId = ctx->GetThisTypeId(stack_entry.offset);
 
-        map.push_back(asIDBVarView { "this", viewType, stateIt });
+            asIDBTypeId typeKey { thisTypeId, asTM_NONE };
+
+            const std::string_view viewType = GetTypeNameFromType(typeKey);
+
+            asIDBVarAddr idKey { thisTypeId, false, thisPtr };
+
+            // locals can safely appear in more than one spot
+            bool exists;
+            auto stateIt = AddVarState(idKey, exists);
+
+            if (!exists)
+            {
+                auto &state = stateIt->second;
+                state.value = evaluators.Evaluate(*this, idKey);
+            }
+
+            map.push_back(asIDBVarView { "this", viewType, stateIt });
+        }
     }
 
     for (int n = start; n < end; n++)
@@ -215,16 +419,24 @@ bool asIDBVarView::operator==(const asIDBVarView &other) const
         int typeId;
         asETypeModifiers modifiers;
         int stackOffset;
-        ctx->GetVar(n, stack_entry.offset, &name, &typeId, &modifiers, nullptr, &stackOffset);
+        ctx->GetVar(n, stack_entry.offset, &name, &typeId, &modifiers, 0, &stackOffset);
+
+        bool isTemporary = stack_entry.type != asIDBLocalType::Parameter && (!name || !*name);
+        
+        if (isTemporary && (stack_entry.type != asIDBLocalType::Temporary))
+            continue;
+        else if (!isTemporary && (stack_entry.type == asIDBLocalType::Temporary))
+            continue;
+
         void *ptr = ctx->GetAddressOfVar(n, stack_entry.offset);
 
         asIDBTypeId typeKey { typeId, modifiers };
 
-        std::string localName = (name && *name) ? fmt::format("name (&{})", n) : fmt::format("&{}", n);
+        std::string localName = (name && *name) ? fmt::format("{} (&{})", name, n) : fmt::format("&{}", n);
 
         const std::string_view viewType = GetTypeNameFromType(typeKey);
 
-        asIDBVarAddr idKey { typeId, ptr };
+        asIDBVarAddr idKey { typeId, (modifiers & asTM_CONST) != 0, ptr };
 
         // locals can safely appear in more than one spot
         bool exists;
@@ -243,13 +455,13 @@ bool asIDBVarView::operator==(const asIDBVarView &other) const
 class asIDBNullTypeEvaluator : public asIDBTypeEvaluator
 {
 public:
-    virtual asIDBVarValue Evaluate(asIDBCache &, asIDBVarAddr id) const override { return { "(null)", true }; }
+    virtual asIDBVarValue Evaluate(asIDBCache &, const asIDBResolvedVarAddr &id) const override { return { "(null)", true }; }
 };
 
 class asIDBUninitTypeEvaluator : public asIDBTypeEvaluator
 {
 public:
-    virtual asIDBVarValue Evaluate(asIDBCache &, asIDBVarAddr id) const override { return { "(uninit)", true }; }
+    virtual asIDBVarValue Evaluate(asIDBCache &, const asIDBResolvedVarAddr &id) const override { return { "(uninit)", true }; }
 };
 
 #include <array>
@@ -257,45 +469,121 @@ public:
 class asIDBEnumTypeEvaluator : public asIDBTypeEvaluator
 {
 public:
-    virtual asIDBVarValue Evaluate(asIDBCache &cache, asIDBVarAddr id) const override
+    virtual asIDBVarValue Evaluate(asIDBCache &cache, const asIDBResolvedVarAddr &id) const override
     {
         // for enums where we have a single matched value
         // just display it directly; it might be a mask but that's OK.
-        auto type = cache.ctx->GetEngine()->GetTypeInfoById(id.typeId);
-        int v = *reinterpret_cast<const int32_t *>(id.address);
+        auto type = cache.ctx->GetEngine()->GetTypeInfoById(id.source.typeId);
+
+        union {
+            asINT64 v = 0;
+            asQWORD uv;
+        };
+        
+        switch (type->GetTypedefTypeId())
+        {
+        case asTYPEID_INT8:
+            v = *reinterpret_cast<const int8_t *>(id.resolved);
+            break;
+        case asTYPEID_UINT8:
+            uv = *reinterpret_cast<const uint8_t *>(id.resolved);
+            break;
+        case asTYPEID_INT16:
+            v = *reinterpret_cast<const int16_t *>(id.resolved);
+            break;
+        case asTYPEID_UINT16:
+            uv = *reinterpret_cast<const uint16_t *>(id.resolved);
+            break;
+        case asTYPEID_INT32:
+            v = *reinterpret_cast<const int32_t *>(id.resolved);
+            break;
+        case asTYPEID_UINT32:
+            uv = *reinterpret_cast<const uint32_t *>(id.resolved);
+            break;
+        case asTYPEID_INT64:
+            v = *reinterpret_cast<const int64_t *>(id.resolved);
+            break;
+        case asTYPEID_UINT64:
+            uv = *reinterpret_cast<const uint64_t *>(id.resolved);
+            break;
+        }
 
         for (asUINT e = 0; e < type->GetEnumValueCount(); e++)
         {
-            int ov = 0;
+            asINT64 ov = 0;
             const char *name = type->GetEnumValueByIndex(e, &ov);
 
             if (ov == v)
+            {
+                if (type->GetTypedefTypeId() >= asTYPEID_UINT8 && type->GetTypedefTypeId() <= asTYPEID_UINT64)
+                    return fmt::format("{} ({})", name, uv);
+
                 return fmt::format("{} ({})", name, v);
+            }
         }
         
         std::bitset<32> bits(v);
 
         if (bits.count() == 1)
+        {
+            if (type->GetTypedefTypeId() >= asTYPEID_UINT8 && type->GetTypedefTypeId() <= asTYPEID_UINT64)
+                return fmt::format("{}", uv );
             return fmt::format("{}", v );
+        }
 
         return { fmt::format("{} bits", bits.count()), false, asIDBExpandType::Entries };
     }
 
-    virtual void Expand(asIDBCache &cache, asIDBVarAddr id, asIDBVarState &state) const override
+    virtual void Expand(asIDBCache &cache, const asIDBResolvedVarAddr &id, asIDBVarState &state) const override
     {
-        auto type = cache.ctx->GetEngine()->GetTypeInfoById(id.typeId);
-        int v = *reinterpret_cast<const int32_t *>(id.address);
+        auto type = cache.ctx->GetEngine()->GetTypeInfoById(id.source.typeId);
 
-        state.entries.push_back({ fmt::format("value: {}", v) });
+        union {
+            asINT64 v = 0;
+            asQWORD uv;
+        };
+        
+        switch (type->GetTypedefTypeId())
+        {
+        case asTYPEID_INT8:
+            v = *reinterpret_cast<const int8_t *>(id.resolved);
+            break;
+        case asTYPEID_UINT8:
+            uv = *reinterpret_cast<const uint8_t *>(id.resolved);
+            break;
+        case asTYPEID_INT16:
+            v = *reinterpret_cast<const int16_t *>(id.resolved);
+            break;
+        case asTYPEID_UINT16:
+            uv = *reinterpret_cast<const uint16_t *>(id.resolved);
+            break;
+        case asTYPEID_INT32:
+            v = *reinterpret_cast<const int32_t *>(id.resolved);
+            break;
+        case asTYPEID_UINT32:
+            uv = *reinterpret_cast<const uint32_t *>(id.resolved);
+            break;
+        case asTYPEID_INT64:
+            v = *reinterpret_cast<const int64_t *>(id.resolved);
+            break;
+        case asTYPEID_UINT64:
+            uv = *reinterpret_cast<const uint64_t *>(id.resolved);
+            break;
+        }
+        
+        if (type->GetTypedefTypeId() >= asTYPEID_UINT8 && type->GetTypedefTypeId() <= asTYPEID_UINT64)
+            state.entries.push_back({ fmt::format("value: {}", uv) });
+        else
+            state.entries.push_back({ fmt::format("value: {}", v) });
         
         // find bit names
-        std::array<const char *, 32> bit_names { };
+        asINT64 ov = 0;
+        std::array<const char *, sizeof(ov) * 8> bit_names { };
 
         for (asUINT e = 0; e < type->GetEnumValueCount(); e++)
         {
-            int ov = 0;
             const char *name = type->GetEnumValueByIndex(e, &ov);
-            std::bitset<32> obits(ov);
+            std::bitset<sizeof(ov) * 8> obits(ov);
 
             // skip masks
             if (obits.count() != 1)
@@ -313,15 +601,15 @@ public:
 
                 // only take the first name, just incase
                 // there's later overrides
-                if (p <= 31 && !bit_names[p])
+                if (p <= (obits.size() - 1) && !bit_names[p])
                     bit_names[p] = name;
             }
         }
 
         // display bits
-        for (asUINT e = 0; e < bit_names.size(); e++)
+        for (asQWORD e = 0; e < bit_names.size(); e++)
         {
-            if (v & (1 << e))
+            if (v & (1ull << e))
             {
                 if (bit_names[e])
                     state.entries.push_back({ fmt::format("[{:2}] {}", e, bit_names[e]) });
@@ -335,70 +623,75 @@ public:
 class asIDBFuncDefTypeEvaluator : public asIDBTypeEvaluator
 {
 public:
-    virtual asIDBVarValue Evaluate(asIDBCache &, asIDBVarAddr id) const override
+    virtual asIDBVarValue Evaluate(asIDBCache &, const asIDBResolvedVarAddr &id) const override
     {
-        asIScriptFunction *ptr = reinterpret_cast<asIScriptFunction *>(id.address);
+        asIScriptFunction *ptr = reinterpret_cast<asIScriptFunction *>(id.resolved);
         return { ptr->GetName(), false };
     }
 };
 
-/*virtual*/ asIDBVarValue asIDBObjectTypeEvaluator::Evaluate(asIDBCache &cache, asIDBVarAddr id) const /*override*/
+/*virtual*/ asIDBVarValue asIDBObjectTypeEvaluator::Evaluate(asIDBCache &cache, const asIDBResolvedVarAddr &id) const /*override*/
 {
     auto ctx = cache.ctx;
-    auto type = ctx->GetEngine()->GetTypeInfoById(id.typeId);
+    auto type = ctx->GetEngine()->GetTypeInfoById(id.source.typeId);
     bool canExpand = type->GetPropertyCount();
     asIDBVarValue val;
 
-    if (auto opForBegin = type->GetMethodByName("opForBegin"))
+    if (ctx->GetState() != asEXECUTION_EXCEPTION)
     {
-        if (opForBegin->GetReturnTypeId() != asTYPEID_UINT32)
+        if (auto opForBegin = type->GetMethodByName("opForBegin"))
         {
-            return { "(unsup. iterator)", true, canExpand ? asIDBExpandType::Children : asIDBExpandType::None };
-        }
+            if (opForBegin->GetReturnTypeId() != asTYPEID_UINT32)
+            {
+                return { "(unsup. iterator)", true, canExpand ? asIDBExpandType::Children : asIDBExpandType::None };
+            }
+            
+            auto opForEnd = type->GetMethodByName("opForEnd");
+            auto opForNext = type->GetMethodByName("opForNext");
 
-        auto opForEnd = type->GetMethodByName("opForEnd");
-        auto opForNext = type->GetMethodByName("opForNext");
-
-        // if we haven't got anything special yet, and we're
-        // iterable, we'll show how many elements we have.
-        // we'll also just assume the code isn't busted.
-        int numElements = 0;
-
-        ctx->PushState();
-        ctx->Prepare(opForBegin);
-        ctx->SetObject(id.address);
-        ctx->Execute();
-
-        uint32_t rtn = ctx->GetReturnDWord();
-
-        while (true)
-        {
-            ctx->Prepare(opForEnd);
-            ctx->SetObject(id.address);
-            ctx->SetArgDWord(0, rtn);
+            // if we haven't got anything special yet, and we're
+            // iterable, we'll show how many elements we have.
+            // we'll also just assume the code isn't busted.
+            int numElements = 0;
+            
+            cache.dbg->internal_execution = true;
+            ctx->PushState();
+            ctx->Prepare(opForBegin);
+            ctx->SetObject(id.resolved);
             ctx->Execute();
-            bool finished = ctx->GetReturnByte();
 
-            if (finished)
-                break;
+            uint32_t rtn = ctx->GetReturnDWord();
+
+            while (true)
+            {
+                ctx->Prepare(opForEnd);
+                ctx->SetObject(id.resolved);
+                ctx->SetArgDWord(0, rtn);
+                ctx->Execute();
+                bool finished = ctx->GetReturnByte();
+
+                if (finished)
+                    break;
                 
-            ctx->Prepare(opForNext);
-            ctx->SetObject(id.address);
-            ctx->SetArgDWord(0, rtn);
-            ctx->Execute();
+                ctx->Prepare(opForNext);
+                ctx->SetObject(id.resolved);
+                ctx->SetArgDWord(0, rtn);
+                ctx->Execute();
 
-            rtn = ctx->GetReturnDWord();
+                rtn = ctx->GetReturnDWord();
 
-            numElements++;
+                numElements++;
+            }
+
+            ctx->PopState();
+            cache.dbg->internal_execution = false;
+
+            val.value = fmt::format("{} elements", numElements);
+            val.disabled = true;
+
+            if (numElements)
+                canExpand = true;
         }
-
-        ctx->PopState();
-
-        val.value = fmt::format("{} elements", numElements);
-        val.disabled = true;
-
-        if (numElements)
-            canExpand = true;
     }
 
     val.expandable = canExpand ? asIDBExpandType::Children : asIDBExpandType::None;
@@ -406,23 +699,23 @@ public:
     return val;
 }
 
-/*virtual*/ void asIDBObjectTypeEvaluator::Expand(asIDBCache &cache, asIDBVarAddr id, asIDBVarState &state) const /*override*/
+/*virtual*/ void asIDBObjectTypeEvaluator::Expand(asIDBCache &cache, const asIDBResolvedVarAddr &id, asIDBVarState &state) const /*override*/
 {
-    asIScriptObject *obj = nullptr;
-
-    if (id.typeId & asTYPEID_SCRIPTOBJECT)
-        obj = (asIScriptObject *) id.address;
-
-    QueryVariableProperties(cache, obj, id, state);
+    QueryVariableProperties(cache, id, state);
 
     QueryVariableForEach(cache, id, state);
 }
 
 // convenience function that queries the properties of the given
 // address (and object, if set) of the given type.
-void asIDBObjectTypeEvaluator::QueryVariableProperties(asIDBCache &cache, asIScriptObject *obj, const asIDBVarAddr &id, asIDBVarState &var) const
+void asIDBObjectTypeEvaluator::QueryVariableProperties(asIDBCache &cache, const asIDBResolvedVarAddr &id, asIDBVarState &var) const
 {
-    auto type = cache.ctx->GetEngine()->GetTypeInfoById(id.typeId);
+    auto type = cache.ctx->GetEngine()->GetTypeInfoById(id.source.typeId);
+
+    asIScriptObject *obj = nullptr;
+
+    if (id.source.typeId & asTYPEID_SCRIPTOBJECT)
+        obj = (asIScriptObject *) id.resolved;
 
     for (asUINT n = 0; n < (obj ? obj->GetPropertyCount() : type->GetPropertyCount()); n++)
     {
@@ -432,29 +725,13 @@ void asIDBObjectTypeEvaluator::QueryVariableProperties(asIDBCache &cache, asIScr
         int offset;
         int compositeOffset;
         bool isCompositeIndirect;
+        bool isReadOnly;
 
-        type->GetProperty(n, &name, &propTypeId, 0, 0, &offset, 0, 0, &compositeOffset, &isCompositeIndirect);
+        type->GetProperty(n, &name, &propTypeId, 0, 0, &offset, 0, 0, &compositeOffset, &isCompositeIndirect, &isReadOnly);
 
-        if (id.typeId & asTYPEID_SCRIPTOBJECT)
-            propAddr = obj->GetAddressOfProperty(n);
-        else
-        {
-            // indirect changes our ptr to
-            // *(object + compositeOffset) + offset
-            if (isCompositeIndirect)
-            {
-                propAddr = *reinterpret_cast<uint8_t **>(reinterpret_cast<uint8_t *>(id.address) + compositeOffset);
+        propAddr = cache.ResolvePropertyAddress(id, n, offset, compositeOffset, isCompositeIndirect);
 
-                // if we're null, leave it alone, otherwise point to
-                // where we really need to be pointing
-                if (propAddr)
-                    propAddr = reinterpret_cast<uint8_t *>(propAddr) + offset;
-            }
-            else
-                propAddr = reinterpret_cast<uint8_t *>(id.address) + offset + compositeOffset;
-        }
-
-        asIDBVarAddr propId { propTypeId, propAddr };
+        asIDBVarAddr propId { propTypeId, isReadOnly, propAddr };
 
         // TODO: variables that overlap memory space will
         // get culled by this. this helps in the case of
@@ -474,17 +751,21 @@ void asIDBObjectTypeEvaluator::QueryVariableProperties(asIDBCache &cache, asIScr
 
         propVar.value = cache.evaluators.Evaluate(cache, propId);
 
-        var.children.push_back(asIDBVarView { name, cache.GetTypeNameFromType({ propTypeId, asTM_NONE }), state });
+        var.children.push_back(asIDBVarView { name, cache.GetTypeNameFromType({ propTypeId, isReadOnly ? asTM_CONST : asTM_NONE }), state });
     }
 }
     
 // convenience function that iterates the opFor* of the given
 // address (and object, if set) of the given type. If non-zero,
 // a specific index will be used.
-void asIDBObjectTypeEvaluator::QueryVariableForEach(asIDBCache &cache, const asIDBVarAddr &id, asIDBVarState &var, int index) const
+void asIDBObjectTypeEvaluator::QueryVariableForEach(asIDBCache &cache, const asIDBResolvedVarAddr &id, asIDBVarState &var, int index) const
 {
     auto ctx = cache.ctx;
-    auto type = ctx->GetEngine()->GetTypeInfoById(id.typeId);
+
+    if (ctx->GetState() == asEXECUTION_EXCEPTION)
+        return;
+
+    auto type = ctx->GetEngine()->GetTypeInfoById(id.source.typeId);
 
     auto opForBegin = type->GetMethodByName("opForBegin");
 
@@ -519,10 +800,11 @@ void asIDBObjectTypeEvaluator::QueryVariableForEach(asIDBCache &cache, const asI
     // iterable, we'll show how many elements we have.
     // we'll also just assume the code isn't busted.
     int elementId = 0;
-
+    
+    cache.dbg->internal_execution = true;
     ctx->PushState();
     ctx->Prepare(opForBegin);
-    ctx->SetObject(id.address);
+    ctx->SetObject(id.resolved);
     ctx->Execute();
 
     uint32_t rtn = ctx->GetReturnDWord();
@@ -530,7 +812,7 @@ void asIDBObjectTypeEvaluator::QueryVariableForEach(asIDBCache &cache, const asI
     while (true)
     {
         ctx->Prepare(opForEnd);
-        ctx->SetObject(id.address);
+        ctx->SetObject(id.resolved);
         ctx->SetArgDWord(0, rtn);
         ctx->Execute();
         bool finished = ctx->GetReturnByte();
@@ -542,7 +824,7 @@ void asIDBObjectTypeEvaluator::QueryVariableForEach(asIDBCache &cache, const asI
         for (auto &opfv : opForValues)
         {
             ctx->Prepare(opfv);
-            ctx->SetObject(id.address);
+            ctx->SetObject(id.resolved);
             ctx->SetArgDWord(0, rtn);
             ctx->Execute();
 
@@ -553,17 +835,31 @@ void asIDBObjectTypeEvaluator::QueryVariableForEach(asIDBCache &cache, const asI
 
             // non-heap stuff has to be copied somewhere
             // so the debugger can read it.
-            if (!addr)
+            // also has to be done for returned handles, because
+            // asIDBResolvedVarAddr assumes handles are always dereferenced.
+            if (!addr || (typeId & (asTYPEID_HANDLETOCONST | asTYPEID_OBJHANDLE)))
             {
-                size_t size = type ? type->GetSize() : ctx->GetEngine()->GetSizeOfPrimitiveType(typeId);
-                stackMemory = std::make_unique<uint8_t[]>(size);
+                if ((!addr) == (typeId & (asTYPEID_HANDLETOCONST | asTYPEID_OBJHANDLE)))
+                    __debugbreak();
+
+                if (typeId & (asTYPEID_HANDLETOCONST | asTYPEID_OBJHANDLE))
+                {
+                    stackMemory = std::make_unique<uint8_t[]>(sizeof(addr));
+                    memcpy(stackMemory.get(), ctx->GetAddressOfReturnValue(), sizeof(addr));
+                }
+                else
+                {
+                    size_t size = type ? type->GetSize() : ctx->GetEngine()->GetSizeOfPrimitiveType(typeId);
+                    stackMemory = std::make_unique<uint8_t[]>(size);
+                    memcpy(stackMemory.get(), ctx->GetAddressOfReturnValue(), size);
+                }
+
                 addr = stackMemory.get();
-                memcpy(addr, ctx->GetAddressOfReturnValue(), size);
             }
 
             asIDBVarMap::iterator state;
 
-            asIDBVarAddr elemId { typeId, addr };
+            asIDBVarAddr elemId { typeId, false, addr };
             bool exists;
             state = cache.AddVarState(elemId, exists);
 
@@ -582,7 +878,7 @@ void asIDBObjectTypeEvaluator::QueryVariableForEach(asIDBCache &cache, const asI
         }
                 
         ctx->Prepare(opForNext);
-        ctx->SetObject(id.address);
+        ctx->SetObject(id.resolved);
         ctx->SetArgDWord(0, rtn);
         ctx->Execute();
 
@@ -592,40 +888,29 @@ void asIDBObjectTypeEvaluator::QueryVariableForEach(asIDBCache &cache, const asI
     }
 
     ctx->PopState();
+    cache.dbg->internal_execution = false;
 }
 
-const asIDBTypeEvaluator &asIDBTypeEvaluatorMap::GetEvaluator(asIDBCache &cache, asIDBVarAddr &id) const
+const asIDBTypeEvaluator &asIDBTypeEvaluatorMap::GetEvaluator(asIDBCache &cache, const asIDBResolvedVarAddr &id) const
 {
     // the only way the base address is null is if
     // it's uninitialized.
     static constexpr const asIDBUninitTypeEvaluator uninitType;
+    static constexpr const asIDBNullTypeEvaluator nullType;
 
-    if (id.address == nullptr)
+    if (id.source.address == nullptr)
         return uninitType;
-
-    void *addr = id.address;
-    
-    // resolve the real address if we're a pointer
-    if (id.typeId & (asTYPEID_OBJHANDLE | asTYPEID_HANDLETOCONST))
-    {
-        static constexpr const asIDBNullTypeEvaluator nullValue;
-
-        addr = *(void **) addr;
-
-        if (addr == nullptr)
-            return nullValue;
-    }
-
-    id.address = addr;
+    else if (id.resolved == nullptr)
+        return nullType;
 
     // do we have a custom evaluator?
-    if (auto f = evaluators.find(id.typeId & (asTYPEID_MASK_OBJECT | asTYPEID_MASK_SEQNBR)); f != evaluators.end())
+    if (auto f = evaluators.find(id.source.typeId & (asTYPEID_MASK_OBJECT | asTYPEID_MASK_SEQNBR)); f != evaluators.end())
         return *f->second.get();
 
-    auto type = cache.ctx->GetEngine()->GetTypeInfoById(id.typeId);
+    auto type = cache.ctx->GetEngine()->GetTypeInfoById(id.source.typeId);
 
     // are we a template?
-    if (id.typeId & asTYPEID_TEMPLATE)
+    if (id.source.typeId & asTYPEID_TEMPLATE)
     {
         // fetch the base type, see if we have a
         // evaluator for that one
@@ -638,7 +923,7 @@ const asIDBTypeEvaluator &asIDBTypeEvaluatorMap::GetEvaluator(asIDBCache &cache,
     // we'll use the fall back evaluators.
     // check primitives first.
 #define CHECK_PRIMITIVE_EVAL(asTypeId, cTypeName) \
-    if (id.typeId == asTypeId) \
+    if (id.source.typeId == asTypeId) \
     { \
         static constexpr const asIDBPrimitiveTypeEvaluator<cTypeName> cTypeName##Type; \
         return cTypeName##Type; \
@@ -674,12 +959,12 @@ const asIDBTypeEvaluator &asIDBTypeEvaluatorMap::GetEvaluator(asIDBCache &cache,
     return objectType;
 }
 
-asIDBVarValue asIDBTypeEvaluatorMap::Evaluate(asIDBCache &cache, asIDBVarAddr id) const
+asIDBVarValue asIDBTypeEvaluatorMap::Evaluate(asIDBCache &cache, const asIDBResolvedVarAddr &id) const
 {
     return GetEvaluator(cache, id).Evaluate(cache, id);
 }
 
-void asIDBTypeEvaluatorMap::Expand(asIDBCache &cache, asIDBVarAddr id, asIDBVarState &state) const
+void asIDBTypeEvaluatorMap::Expand(asIDBCache &cache, const asIDBResolvedVarAddr &id, asIDBVarState &state) const
 {
     GetEvaluator(cache, id).Expand(cache, id, state);
 }
@@ -693,6 +978,9 @@ void asIDBTypeEvaluatorMap::Register(int typeId, std::unique_ptr<asIDBTypeEvalua
 
 /*static*/ void asIDBDebugger::LineCallback(asIScriptContext *ctx, asIDBDebugger *debugger)
 {
+    if (debugger->internal_execution)
+        return;
+
     // we might not have an action - functions called from within
     // the debugger will never have this set.
     if (debugger->action != asIDBAction::None)
@@ -724,46 +1012,63 @@ void asIDBTypeEvaluatorMap::Register(int typeId, std::unique_ptr<asIDBTypeEvalua
     // breakpoints are handled here. note that a single
     // breakpoint can be hit by multiple things on the same
     // line.
-    if (!debugger->breakpoints.empty())
+    bool break_from_bp = false;
+
     {
-        const char *section = nullptr;
-        int row = ctx->GetLineNumber(0, nullptr, &section);
+        std::scoped_lock lock(debugger->mutex);
 
-        if (section && debugger->breakpoints.find(asIDBBreakpoint::FileLocation(asIDBBreakpointLocation { section, row })) != debugger->breakpoints.end())
-            debugger->DebugBreak(ctx);
-
-        // FIXME: this makes an std::string every time
-        auto func = ctx->GetFunction(0);
-        if (auto f = debugger->breakpoints.find(asIDBBreakpoint::Function(func->GetName())); f != debugger->breakpoints.end())
+        if (!debugger->breakpoints.empty())
         {
-            debugger->breakpoints.erase(f);
-            debugger->DebugBreak(ctx);
-        }
+            const char *section = nullptr;
+            int row = ctx->GetLineNumber(0, nullptr, &section);
 
-        return;
+            if (section && debugger->breakpoints.find(asIDBBreakpoint::FileLocation(asIDBBreakpointLocation { section, row })) != debugger->breakpoints.end())
+                break_from_bp = true;
+            else
+            {
+                // FIXME: this makes an std::string every time
+                auto func = ctx->GetFunction(0);
+                if (auto f = debugger->breakpoints.find(asIDBBreakpoint::Function(func->GetName())); f != debugger->breakpoints.end())
+                {
+                    debugger->breakpoints.erase(f);
+                    break_from_bp = true;
+                }
+            }
+        }
     }
+
+    if (break_from_bp)
+        debugger->DebugBreak(ctx);
 }
 
 void asIDBDebugger::HookContext(asIScriptContext *ctx)
 {
-    if (cache && cache->ctx == ctx)
-        return;
-    
-    cache = CreateCache(ctx);
-    ctx->SetLineCallback(asFUNCTION(asIDBDebugger::LineCallback), this, asCALL_CDECL);
+    // TODO: is this safe to be called even if
+    // the context is being switched?
+    if (ctx->GetState() != asEXECUTION_EXCEPTION)
+        ctx->SetLineCallback(asFUNCTION(asIDBDebugger::LineCallback), this, asCALL_CDECL);
 }
 
 void asIDBDebugger::DebugBreak(asIScriptContext *ctx)
 {
     action = asIDBAction::None;
+    {
+        std::scoped_lock lock(mutex);
+        std::unique_ptr<asIDBCache> new_cache = CreateCache(ctx);
+
+        if (cache)
+            new_cache->Restore(*cache);
+
+        std::swap(cache, new_cache);
+    }
     HookContext(ctx);
-    cache->Refresh();
     Suspend();
 }
 
 bool asIDBDebugger::HasWork()
 {
-    return !breakpoints.empty();
+    std::scoped_lock lock(mutex);
+    return !breakpoints.empty() && action == asIDBAction::None;
 }
 
 // debugger operations; these set the next breakpoint
@@ -772,20 +1077,25 @@ void asIDBDebugger::StepInto()
 {
     action = asIDBAction::StepInto;
     stack_size = cache->ctx->GetCallstackSize();
-    Resume();
+    Continue();
 }
 
 void asIDBDebugger::StepOver()
 {
     action = asIDBAction::StepOver;
     stack_size = cache->ctx->GetCallstackSize();
-    Resume();
+    Continue();
 }
 
 void asIDBDebugger::StepOut()
 {
     action = asIDBAction::StepOut;
     stack_size = cache->ctx->GetCallstackSize();
+    Continue();
+}
+
+void asIDBDebugger::Continue()
+{
     Resume();
 }
 
@@ -803,4 +1113,19 @@ bool asIDBDebugger::ToggleBreakpoint(std::string_view section, int line)
         breakpoints.insert(bp);
         return true;
     }
+}
+
+/*virtual*/ void asIDBDebugger::CacheSections(asIScriptModule *module)
+{
+    for (asUINT n = 0; n < module->GetFunctionCount(); n++)
+    {
+        const char *section = nullptr;
+        module->GetFunctionByIndex(n)->GetDeclaredAt(&section, nullptr, nullptr);
+        EnsureSectionCached(section, section);
+    }
+}
+
+/*virtual*/ void asIDBDebugger::EnsureSectionCached(std::string_view section, std::string_view canonical)
+{
+    sections.insert({ section, canonical });
 }
