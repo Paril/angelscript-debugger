@@ -19,29 +19,25 @@
 
 #include <unordered_map>
 #include <unordered_set>
+#include <set>
 #include <type_traits>
 #include <string>
-#include <map>
-#include <fmt/format.h>
+#include <set>
 #include <variant>
-#include <optional>
 #include <mutex>
+#include <filesystem>
+#include <optional>
+#include <memory>
 #include "angelscript.h"
 
-template <class T>
-inline void asIDBHashCombine(size_t &seed, const T& v)
-{
-    std::hash<T> hasher;
-    seed ^= hasher(v) + 0x9e3779b9 + (seed<<6) + (seed>>2);
-}
+#ifdef __cpp_lib_format
+#include <format>
+namespace fmt = std;
+#else
+#include <fmt/format.h>
+#endif
 
-enum class asIDBExpandType : uint8_t
-{
-    None,      // no expansion
-    Value,     // expands to display value
-    Children,  // expands to display children
-    Entries    // expands to display entries
-};
+class asIDBDebugger;
 
 struct asIDBTypeId
 {
@@ -53,6 +49,13 @@ struct asIDBTypeId
         return typeId == other.typeId && modifiers == other.modifiers;
     }
 };
+
+template <class T>
+inline void asIDBHashCombine(size_t &seed, const T& v)
+{
+    std::hash<T> hasher;
+    seed ^= hasher(v) + 0x9e3779b9 + (seed<<6) + (seed>>2);
+}
 
 template<>
 struct std::hash<asIDBTypeId>
@@ -90,19 +93,15 @@ struct asIDBVarAddr
     {
         return typeId == other.typeId && address == other.address && constant == other.constant;
     }
-};
 
-// a resolved reference of a `asIDBVarAddr`. Similar to `asIDBVarAddr`,
-// you should not keep these around very long.
-struct asIDBResolvedVarAddr
-{
-    asIDBVarAddr    source;
-    void            *resolved = nullptr;
-
-    constexpr asIDBResolvedVarAddr(asIDBVarAddr source) :
-        source(source),
-        resolved((source.typeId & (asTYPEID_HANDLETOCONST | asTYPEID_OBJHANDLE)) ? *(void **)source.address : source.address)
+    template<typename T>
+    T *ResolveAs() const
     {
+        if (!address)
+            return nullptr;
+        else if (typeId & (asTYPEID_HANDLETOCONST | asTYPEID_OBJHANDLE))
+            return *reinterpret_cast<T **>(address);
+        return reinterpret_cast<T*>(address);
     }
 };
 
@@ -117,143 +116,317 @@ struct std::hash<asIDBVarAddr>
     }
 };
 
-using asIDBVarMap = std::unordered_map<asIDBVarAddr, struct asIDBVarState>;
-
-// base type for a variable that can be viewed
-// in the debugger. watch & non-watch type views
-// store their data slightly differently.
-struct asIDBVarViewBase
+// helper class that is similar to an any,
+// storing a value of any type returned by AS
+// and managing the ref count.
+struct asIDBValue
 {
-    virtual ~asIDBVarViewBase() { }
+public:
+    asIScriptEngine *engine = nullptr;
+    int typeId = 0;
+    asITypeInfo *type = nullptr;
 
-    std::string              name;
-    std::string_view         type;
+    union {
+        asBYTE   u8;
+        asWORD   u16;
+        asDWORD  u32;
+        asQWORD  u64;
+        float    flt;
+        double   dbl;
+        void     *obj;
+    } value {};
 
-    inline asIDBVarViewBase(std::string name, std::string_view type) :
-        name(name),
-        type(type)
+    asIDBValue() = default;
+
+    asIDBValue(asIScriptEngine *engine, void *ptr, int typeId, bool reference = false) :
+        engine(engine),
+        typeId(typeId)
     {
+        if (!typeId)
+            return;
+
+        type = engine->GetTypeInfoById(typeId);
+
+        if (type)
+            type->AddRef();
+
+        if (reference)
+            ptr = *reinterpret_cast<void **>(ptr);
+
+        if (typeId & asTYPEID_OBJHANDLE)
+        {
+		    value.obj = *reinterpret_cast<void **>(ptr);
+		    engine->AddRefScriptObject(value.obj, type);
+        }
+	    else if (typeId & asTYPEID_MASK_OBJECT)
+	    {
+		    value.obj = engine->CreateScriptObjectCopy(ptr, type);
+	    }
+	    else
+	    {
+		    value.u64 = 0;
+		    int size = engine->GetSizeOfPrimitiveType(typeId);
+		    memcpy(&value.u64, ptr, size);
+	    }
     }
 
-    virtual const asIDBVarAddr &GetID() = 0;
-    virtual asIDBVarState &GetState() = 0;
-    virtual bool IsValid() = 0;
+    asIDBValue(const asIDBValue &other) :
+        engine(other.engine),
+        typeId(other.typeId),
+        type(other.type)
+    {
+        if (!typeId)
+            return;
+
+        if (type)
+            type->AddRef();
+
+        if (typeId & asTYPEID_OBJHANDLE)
+        {
+            value.obj = other.value.obj;
+		    engine->AddRefScriptObject(value.obj, type);
+        }
+	    else if (typeId & asTYPEID_MASK_OBJECT)
+	    {
+		    value.obj = engine->CreateScriptObjectCopy(other.value.obj, type);
+	    }
+	    else
+		    value.u64 = other.value.u64;
+    }
+
+    asIDBValue(asIDBValue &&other) noexcept :
+        engine(other.engine),
+        typeId(other.typeId),
+        type(other.type)
+    {
+        if (!typeId)
+            return;
+
+		value.u64 = other.value.u64;
+
+        other.type = nullptr;
+        other.typeId = 0;
+        other.value.u64 = 0;
+    }
+
+    asIDBValue &operator=(const asIDBValue &other)
+    {
+        engine = other.engine;
+        typeId = other.typeId;
+        type = other.type;
+        value.u64 = 0;
+
+        if (!typeId)
+            return *this;
+
+        if (type)
+            type->AddRef();
+
+        if (typeId & asTYPEID_OBJHANDLE)
+        {
+            value.obj = other.value.obj;
+		    engine->AddRefScriptObject(value.obj, type);
+        }
+	    else if (typeId & asTYPEID_MASK_OBJECT)
+	    {
+		    value.obj = engine->CreateScriptObjectCopy(other.value.obj, type);
+	    }
+	    else
+		    value.u64 = other.value.u64;
+
+        return *this;
+    }
+
+    asIDBValue &operator=(asIDBValue &&other) noexcept
+    {
+        engine = other.engine;
+        typeId = other.typeId;
+        type = other.type;
+        value.u64 = 0;
+
+        if (!typeId)
+            return *this;
+
+		value.u64 = other.value.u64;
+
+        other.type = nullptr;
+        other.typeId = 0;
+        other.value.u64 = 0;
+
+        return *this;
+    }
+
+    ~asIDBValue()
+    {
+        Release();
+    }
+
+    void Release()
+    {
+	    if (typeId & asTYPEID_MASK_OBJECT)
+		    engine->ReleaseScriptObject(value.obj, type);
+
+        if (type)
+            type->Release();
+
+        type = nullptr;
+        typeId = 0;
+        value.u64 = 0;
+    }
+
+    bool IsValid() const
+    {
+        return typeId != 0;
+    }
+
+    template<typename T>
+    T *GetPointer(bool as_reference = false) const
+    {
+        if (typeId == 0)
+            throw std::runtime_error("nothing to point to");
+
+        if (typeId & asTYPEID_MASK_OBJECT)
+        {
+            if ((typeId & asTYPEID_OBJHANDLE) && as_reference)
+                return reinterpret_cast<T *>(const_cast<void **>(&value.obj));
+            return reinterpret_cast<T *>(value.obj);
+        }
+        return reinterpret_cast<T *>(const_cast<asQWORD *>(&value.u64));
+    }
 };
 
-// variables can be referenced by different names.
-// this lets them retain their proper decl.
-struct asIDBVarView : public asIDBVarViewBase
+// a variable name; ns is only non-blank for globals.
+// to make the code simpler, "::" and "" should be equal.
+struct asIDBVarName
 {
-    asIDBVarMap::iterator    var;
+    std::string name;
+    std::string ns;
 
-    inline asIDBVarView(std::string name, std::string_view type, asIDBVarMap::iterator var) :
-        asIDBVarViewBase(name, type),
-        var(var)
-    {
-    }
+    asIDBVarName() = default;
 
-    virtual const asIDBVarAddr &GetID() override;
-    virtual asIDBVarState &GetState() override;
-    virtual bool IsValid() override { return true; }
-};
-
-using asIDBVarViewVector = std::vector<asIDBVarView>;
-
-// an individual value rendered out by the debugger.
-struct asIDBVarValue
-{
-    bool disabled = false; // render with a different style
-    asIDBExpandType expandable = asIDBExpandType::None;
-    std::string value; // value to display in a value column or when expanded
-
-    inline asIDBVarValue(const char *v, bool disabled = false, asIDBExpandType expandable = asIDBExpandType::None) :
-        disabled(disabled),
-        expandable(expandable),
-        value(v ? v : "")
-    {
-    }
-
-    inline asIDBVarValue(std::string v, bool disabled = false, asIDBExpandType expandable = asIDBExpandType::None) :
-        disabled(disabled),
-        expandable(expandable),
-        value(v)
+    template<typename T>
+    asIDBVarName(T name) :
+        name(name)
     {
     }
     
-    asIDBVarValue(const asIDBVarValue &) = default;
-    asIDBVarValue(asIDBVarValue &&) = default;
-    asIDBVarValue &operator=(const asIDBVarValue &) = default;
-    asIDBVarValue &operator=(asIDBVarValue &&) = default;
-    asIDBVarValue() = default;
-};
-
-using asIDBVarValueVector = std::vector<asIDBVarValue>;
-
-// a variable displayed in the debugger.
-struct asIDBVarState
-{
-    asIDBVarValue value = {};
-    std::unique_ptr<uint8_t[]> stackMemory; // if we're referring to a temporary value and not a handle
-                                            // we have to make a copy of the value here since it won't
-                                            // be available after the context is called (for getting
-                                            // array elements, calling property getters, etc).
-
-    // set when either children or entries have been
-    // queried already.
-    bool queriedChildren = false;
-
-    // children views; this only matters when
-    // value.expandable is asIDBExpandType::Children
-    asIDBVarViewVector children;
-
-    // entries; these are special bullet points
-    // when value.expandable is asIDBExpandType::Entries
-    asIDBVarValueVector entries;
-};
-
-enum class asIDBLocalType : uint8_t
-{
-    Parameter, // parameter sent to function
-    Variable,  // local named variable
-    Temporary  // a temporary; has no name but has a stack offset & type
-};
-
-// key used for storage into the local map.
-struct asIDBLocalKey
-{
-    uint8_t          offset;
-    asIDBLocalType   type;    
-
-    inline asIDBLocalKey(int offset, asIDBLocalType type) :
-        offset(offset),
-        type(type)
+    template<typename Ta, typename Tb>
+    asIDBVarName(Ta ns, Tb name) :
+        name(name),
+        ns(ns)
     {
     }
 
-    constexpr bool operator==(const asIDBLocalKey &k) const
+    inline bool operator<(const asIDBVarName &b) const
     {
-        return offset == k.offset && type == k.type;
+        if (ns == b.ns)
+            return name < b.name;
+
+        return ns < b.ns;
+    }
+
+    inline std::string Combine() const
+    {
+        if (!ns.empty())
+            return fmt::format("{}::{}", ns, name);
+        return name;
     }
 };
 
-template<>
-struct std::hash<asIDBLocalKey>
+// a variable for the debugger.
+struct asIDBVariable
 {
-    inline std::size_t operator()(const asIDBLocalKey &key) const
+    using Ptr = std::shared_ptr<asIDBVariable>;
+    using WeakPtr = std::weak_ptr<asIDBVariable>;
+    using Set = std::unordered_set<Ptr>;
+    using WeakVector = std::vector<WeakPtr>;
+    using Vector = std::vector<Ptr>;
+    using Map = std::unordered_map<int64_t, WeakPtr>;
+    
+    struct PtrLess
     {
-        std::size_t h = std::hash<uint8_t>()(key.offset);
-        asIDBHashCombine(h, std::hash<asIDBLocalType>()(key.type));
-        return h;
+        inline bool operator()(const asIDBVariable::Ptr &a, const asIDBVariable::Ptr &b) const
+        {
+            return a->identifier < b->identifier;
+        }
+    };
+
+    using SortedSet = std::set<Ptr, PtrLess>;
+
+    asIDBDebugger &dbg;
+    WeakPtr       ptr;
+
+    asIDBVarName identifier;
+    // if we are owned by another variable,
+    // it's pointed to here.
+    WeakPtr      owner;
+
+    // address will be non-null if we have a value
+    // that can be retrieved. this might be null
+    // for 'fake' variables or ones yet to be fetched.
+    asIDBVarAddr address {};
+
+    // these are only available after `evaluated` is true.
+    std::string      value;
+    std::string_view typeName;
+    asIDBValue       stackValue;
+
+    // if it's a getter, this will be set.
+    asIScriptFunction          *getter = nullptr;
+    Ptr                        get_evaluated;
+    
+    bool evaluated = false;
+    bool expanded = false;
+
+    asIDBVariable(asIDBDebugger &dbg) :
+        dbg(dbg)
+    {
     }
+
+    const SortedSet &Children() const { return children; }
+    void MakeExpandable();
+    void PushChild(Ptr ptr);
+    int64_t RefId() const { return ref_id.value_or(0); }
+
+    Ptr CreateChildVariable(asIDBVarName identifier, asIDBVarAddr address, std::string_view typeName);
+
+    void Evaluate();
+    void Expand();
+
+private:
+    // if ref_id is set, the variable has children.
+    // call asIDBCache::LinkVariable to set this.
+    std::optional<int64_t>     ref_id {};
+    SortedSet                  children;
 };
 
-using asIDBLocalMap = std::unordered_map<asIDBLocalKey, asIDBVarViewVector>;
+// a local, fetched from GetVar
+constexpr uint32_t SCOPE_SYSTEM = (uint32_t) -1;
+
+// A scope contains variables.
+struct asIDBScope
+{
+    uint32_t           offset; // offset in stack fetches (GetVar, etc)
+    asIDBVariable::Ptr parameters;
+    asIDBVariable::Ptr locals;
+    asIDBVariable::Ptr registers; // "temporaries"
+
+    std::unordered_map<uint32_t, asIDBVariable::WeakPtr> local_by_index;
+    asIDBVariable::WeakPtr this_ptr;
+
+    asIDBScope(asUINT offset, asIDBDebugger &dbg, asIScriptFunction *function);
+
+private:
+    void CalcLocals(asIDBDebugger &dbg, asIScriptFunction *function, asIDBVariable::Ptr &container);
+};
 
 struct asIDBCallStackEntry
 {
+    int64_t             id; // unique id during debugging
     std::string         declaration;
     std::string_view    section;
     int                 row, column;
+    asIDBScope          scope;
 };
 
 using asIDBCallStackVector = std::vector<asIDBCallStackEntry>;
@@ -266,111 +439,217 @@ class asIDBCache;
 class asIDBTypeEvaluator
 {
 public:
-    // evaluate the given id into a value. this tells
-    // the debugger how to display the object.
-    virtual asIDBVarValue Evaluate(asIDBCache &, const asIDBResolvedVarAddr &id) const { return {}; }
+    // evaluate the given variable.
+    virtual void Evaluate(asIDBVariable::Ptr var) const { }
 
     // for expandable objects, this is called when the
     // debugger requests it be expanded.
-    virtual void Expand(asIDBCache &, const asIDBResolvedVarAddr &id, asIDBVarState &state) const { }
+    virtual void Expand(asIDBVariable::Ptr var) const { }
 };
 
 // built-in evaluators you can extend for
 // making custom evaluators.
-
 template<typename T>
 class asIDBPrimitiveTypeEvaluator : public asIDBTypeEvaluator
 {
 public:
-    virtual asIDBVarValue Evaluate(asIDBCache &, const asIDBResolvedVarAddr &id) const override
+    virtual void Evaluate(asIDBVariable::Ptr var) const override;
+};
+
+// helper class to deal with foreach iteration.
+class asIDBObjectIteratorHelper
+{
+public:
+    asIDBDebugger                       &dbg;
+    asITypeInfo                         *type;
+    void                                *obj;
+    asIScriptFunction                   *opForBegin, *opForEnd, *opForNext;
+    std::vector<asIScriptFunction *>    opForValues;
+
+    asITypeInfo *iteratorType = nullptr;
+    int         iteratorTypeId = 0;
+
+    std::string_view    error;
+
+    struct IteratorValue
     {
-        return { fmt::format("{}", *reinterpret_cast<const T *>(id.source.address)), false };
-    }
+        const asIDBObjectIteratorHelper *helper;
+        asIDBValue                       value;
+
+        IteratorValue() = delete;
+
+        static IteratorValue FromCtxReturn(const asIDBObjectIteratorHelper *helper, asIScriptContext *ctx, asETypeModifiers flags)
+        {
+            return { helper, asIDBValue(ctx->GetEngine(), ctx->GetAddressOfReturnValue(), helper->iteratorTypeId, flags) };
+        }
+
+        void SetArg(asIScriptContext *ctx, asUINT index) const
+        {
+            if (helper->iteratorTypeId & asTYPEID_MASK_OBJECT)
+                ctx->SetArgObject(index, value.GetPointer<void *>());
+            else if (helper->iteratorTypeId == asTYPEID_BOOL ||
+                     helper->iteratorTypeId == asTYPEID_INT8 ||
+                     helper->iteratorTypeId == asTYPEID_UINT8)
+                ctx->SetArgByte(index, *value.GetPointer<uint8_t>());
+            else if (helper->iteratorTypeId == asTYPEID_INT16 ||
+                     helper->iteratorTypeId == asTYPEID_UINT16)
+                ctx->SetArgWord(index, *value.GetPointer<uint16_t>());
+            else if (helper->iteratorTypeId == asTYPEID_INT32 ||
+                     helper->iteratorTypeId == asTYPEID_UINT32)
+                ctx->SetArgDWord(index, *value.GetPointer<uint32_t>());
+            else if (helper->iteratorTypeId == asTYPEID_INT64 ||
+                     helper->iteratorTypeId == asTYPEID_UINT64)
+                ctx->SetArgQWord(index, *value.GetPointer<uint64_t>());
+            else if (helper->iteratorTypeId == asTYPEID_FLOAT)
+                ctx->SetArgFloat(index, *value.GetPointer<float>());
+            else if (helper->iteratorTypeId == asTYPEID_DOUBLE)
+                ctx->SetArgDouble(index, *value.GetPointer<double>());
+            else
+                throw std::runtime_error("invalid type");
+        }
+
+        IteratorValue(const IteratorValue &other) = default;
+        IteratorValue(IteratorValue &&move) noexcept = default;
+
+        IteratorValue &operator=(const IteratorValue &other) = default;
+        IteratorValue &operator=(IteratorValue &&move) noexcept = default;
+
+    private:
+        IteratorValue(const asIDBObjectIteratorHelper *helper, asIDBValue &&value) :
+            helper(helper),
+            value(value)
+        {
+        }
+    };
+
+    asIDBObjectIteratorHelper(asIDBDebugger &dbg, asITypeInfo *type, void *obj);
+
+    constexpr bool IsValid() const { return opForBegin != nullptr; }
+    constexpr explicit operator bool() const { return IsValid(); }
+    
+    // individual access
+    IteratorValue Begin(asIScriptContext *ctx) const;
+    void Value(asIScriptContext *ctx, const IteratorValue &val, size_t index) const;
+    IteratorValue Next(asIScriptContext *ctx, const IteratorValue &val) const;
+    bool End(asIScriptContext *ctx, const IteratorValue &val) const;
+
+    // O(n) helper for length
+    size_t CalculateLength(asIScriptContext *ctx) const;
+
+private:
+    bool Validate();
 };
 
 class asIDBObjectTypeEvaluator : public asIDBTypeEvaluator
 {
 public:
-    virtual asIDBVarValue Evaluate(asIDBCache &cache, const asIDBResolvedVarAddr &id) const override;
-    virtual void Expand(asIDBCache &cache, const asIDBResolvedVarAddr &id, asIDBVarState &state) const override;
+    virtual void Evaluate(asIDBVariable::Ptr var) const override;
+
+    virtual void Expand(asIDBVariable::Ptr var) const override;
 
 protected:
     // convenience function that queries the properties of the given
     // address (and object, if set) of the given type.
-    void QueryVariableProperties(asIDBCache &cache, const asIDBResolvedVarAddr &id, asIDBVarState &var) const;
-    
+    void QueryVariableProperties(asIDBVariable::Ptr var) const;
+
+    // convenience function that queries for getter property functions.
+    void QueryVariableGetters(asIDBVariable::Ptr var) const;
+
+    // convenience function to check the above two
+    // to see if we have anything to expand.
+    bool CanExpand(asIDBVariable::Ptr var) const;
+
+    // convenience function to check if a function is
+    // a compatible getter method
+    bool IsCompatibleGetter(asIScriptFunction *function) const;
+
     // convenience function that iterates the opFor* of the given
     // address (and object, if set) of the given type. If positive,
     // a specific index will be used.
-    void QueryVariableForEach(asIDBCache &cache, const asIDBResolvedVarAddr &id, asIDBVarState &var, int index = -1) const;
+    void QueryVariableForEach(asIDBVariable::Ptr var, int index = -1) const;
 };
 
-// This class manages `asIDBTypeEvaluator` instances
-// and handles the logic of finding the best
-// instance for the given type.
-// Type evaluation only deals with the lower bits of
-// type IDs; null/uninit is handled automatically
-// and never reaches the evaluator.
-// You can register existing IDs to replace their implementation.
-// When a type ID is not explicily registered, a static evaluator
-// will take over. Note that you must register the type ID's
-// sequence number, so remove any additional flags (asTYPEID_MASK_OBJECT | asTYPEID_MASK_SEQNBR).
-class asIDBTypeEvaluatorMap
+// simple std::expected-like
+template<typename T>
+struct asIDBExpected
 {
-    std::unordered_map<int, std::unique_ptr<asIDBTypeEvaluator>> evaluators;
-
-    // fetch the evaluator for the given type id.
-    const asIDBTypeEvaluator &GetEvaluator(class asIDBCache &, const asIDBResolvedVarAddr &id) const;
+private:
+    std::variant<std::string_view, T> data;
 
 public:
-    // evaluate the given id into a value. this tells
-    // the debugger how to display the object.
-    asIDBVarValue Evaluate(class asIDBCache &, const asIDBResolvedVarAddr &id) const;
-
-    // for expandable objects, this is called when the
-    // debugger requests it be expanded.
-    void Expand(class asIDBCache &, const asIDBResolvedVarAddr &id, asIDBVarState &state) const;
-
-    // Register an evaluator.
-    void Register(int typeId, std::unique_ptr<asIDBTypeEvaluator> evaluator);
-
-    // A quick shortcut to make a templated instantiation
-    // of T from the given type name.
-    template<typename T>
-    void Register(asIScriptEngine *engine, const char *name)
-    {
-        Register(engine->GetTypeInfoByName(name)->GetTypeId(), std::make_unique<T>());
-    }
-};
-
-// the result of an expression evaluation.
-// note that this currently only supports
-// storing a chain of valid, non-temporary
-// fetches that result in a single value.
-struct asIDBExprResult
-{
-    asIDBVarAddr    idKey;
-    asIDBVarState   value;
-};
-
-// watch entry name + result.
-// set to dirty if the value is out of date.
-struct asIDBWatchEntry : public asIDBVarViewBase
-{
-    bool                               dirty = true;
-    std::optional<asIDBExprResult>     result;
-
-    inline asIDBWatchEntry(const char *expr) :
-        asIDBVarViewBase(expr, "")
+    constexpr asIDBExpected() :
+        data("unknown error")
     {
     }
 
-    virtual const asIDBVarAddr &GetID() override { return result->idKey; }
-    virtual asIDBVarState &GetState() override { return result->value; }
-    virtual bool IsValid() override { return result.has_value(); }
+    constexpr asIDBExpected(const std::string_view v) :
+        data(std::in_place_index<0>, v)
+    {
+    }
+
+    constexpr asIDBExpected(T &&v) :
+        data(std::in_place_index<1>, std::move(v))
+    {
+    }
+
+    constexpr asIDBExpected(const T &v) :
+        data(std::in_place_index<1>, v)
+    {
+    }
+
+    constexpr asIDBExpected(asIDBExpected<void> &&v);
+    
+    asIDBExpected(const asIDBExpected<T> &) = default;
+    asIDBExpected(asIDBExpected<T> &&) = default;
+    asIDBExpected &operator=(const asIDBExpected<T> &) = default;
+    asIDBExpected &operator=(asIDBExpected<T> &&) = default;
+
+    constexpr asIDBExpected &operator=(const T &v)
+    {
+        return *this = asIDBExpected<T>(v);
+    }
+
+    constexpr asIDBExpected &operator=(T &&v)
+    {
+        return *this = asIDBExpected<T>(v);
+    }
+    
+    constexpr bool has_value() const { return data.index() == 1; }
+    constexpr explicit operator bool() const { return has_value(); }
+    
+    constexpr const std::string_view &error() const { return std::get<0>(data); }
+    constexpr const T &value() const { return std::get<1>(data); }
+    constexpr T &value() { return std::get<1>(data); }
 };
 
-using asIDBWatchEntryVector = std::vector<asIDBWatchEntry>;
+template<>
+struct asIDBExpected<void>
+{
+private:
+    std::string_view err;
+
+public:
+    constexpr asIDBExpected() :
+        err("unknown error")
+    {
+    }
+
+    constexpr asIDBExpected(const std::string_view v) :
+        err(v)
+    {
+    }
+
+    constexpr const std::string_view &error() const { return err; }
+};
+
+template<typename T>
+constexpr asIDBExpected<T>::asIDBExpected(asIDBExpected<void> &&v) :
+    data(std::in_place_index<0>, v.error())
+{
+}
+ 
+template<class E> 
+asIDBExpected(E) -> asIDBExpected<void>;
 
 // this class holds the cached state of stuff
 // so that we're not querying things from AS
@@ -394,30 +673,22 @@ public:
     // cache of type id+modifiers to names
     asIDBTypeNameMap type_names;
 
-    // cache of data for type+addr
-    asIDBVarMap var_states;
-
-    // cached globals
-    bool globalsCached = false;
-    asIDBVarViewVector globals;
-
-    // cached locals
-    asIDBLocalMap locals;
-
-    // cached watch
-    asIDBWatchEntryVector watch;
-
     // cached call stack
-    std::string system_function;
     asIDBCallStackVector call_stack;
 
-    // type evaluators
-    asIDBTypeEvaluatorMap evaluators;
+    // cached globals
+    asIDBVariable::Ptr globals;
+
+    // cached set of variables
+    asIDBVariable::Set variables;
+
+    // cached map of var IDs to their variable.
+    asIDBVariable::Map variable_refs;
 
     // ptr back to debugger
-    class asIDBDebugger *dbg;
+    asIDBDebugger &dbg;
 
-    inline asIDBCache(class asIDBDebugger *dbg, asIScriptContext *ctx) :
+    inline asIDBCache(asIDBDebugger &dbg, asIScriptContext *ctx) :
         dbg(dbg),
         ctx(ctx)
     {
@@ -437,9 +708,6 @@ public:
     // caches all of the global properties in the context.
     virtual void CacheGlobals();
 
-    // caches all of the locals with the specified key.
-    virtual void CacheLocals(asIDBLocalKey stack_entry);
-
     // cache call stack entries
     virtual void CacheCallstack();
 
@@ -448,21 +716,16 @@ public:
     // the state of active entries.
     virtual void Refresh();
 
-    // adds the variable state for the given type, if it
-    // doesn't already exist.
-    asIDBVarMap::iterator AddVarState(asIDBVarAddr id, bool &exists)
-    {
-        auto v = var_states.try_emplace(id);
-        exists = !v.second;
-        return v.first;
-    }
-
     // get a safe view into a cached type string.
     virtual const std::string_view GetTypeNameFromType(asIDBTypeId id);
 
     // for the given type + property data, fetch the address of the
     // value that this property points to.
-    virtual void *ResolvePropertyAddress(const asIDBResolvedVarAddr &id, int propertyIndex, int offset, int compositeOffset, bool isCompositeIndirect);
+    virtual void *ResolvePropertyAddress(const asIDBVarAddr &id, int propertyIndex, int offset, int compositeOffset, bool isCompositeIndirect);
+
+    // fetch an evaluator for the given resolved address.
+    // the built-in implementation only handles a few base evaluators.
+    virtual const asIDBTypeEvaluator &GetEvaluator(const asIDBVarAddr &id) const;
 
     // resolve the given expression to a unique var state.
     // `expr` must contain a resolvable expression; it's a limited
@@ -487,87 +750,105 @@ public:
     //   Only uint indices are supported. You may also optionally select which
     //   value to retrieve from multiple opValue implementations; if not specified
     //   it will default to zero (that is to say, [0] and [0,0] are equivalent).
-    virtual std::optional<asIDBExprResult> ResolveExpression(const std::string_view expr, int stack_index);
-
+    virtual asIDBExpected<asIDBVariable::WeakPtr> ResolveExpression(std::string_view expr, std::optional<int> stack_index);
+    
     // Resolve the remainder of a sub-expression; see ResolveExpression
     // for the syntax.
-    virtual std::optional<asIDBExprResult> ResolveSubExpression(const asIDBResolvedVarAddr &idKey, const std::string_view rest, int stack_index);
-};
+    virtual asIDBExpected<asIDBVariable::WeakPtr> ResolveSubExpression(asIDBVariable::WeakPtr var, const std::string_view rest);
 
-struct asIDBBreakpointLocation
-{
-    std::string_view    section;
-    int                 line;
-
-    constexpr bool operator==(const asIDBBreakpointLocation &k) const
+    // Create a variable container. Generally you don't call
+    // this directly, unless you need a blank variable.
+    asIDBVariable::Ptr CreateVariable()
     {
-        return section == k.section && line == k.line;
-    }
-};
-
-template<>
-struct std::hash<asIDBBreakpointLocation>
-{
-    inline std::size_t operator()(const asIDBBreakpointLocation &key) const
-    {
-        std::size_t h = std::hash<std::string_view>()(key.section);
-        asIDBHashCombine(h, key.line);
-        return h;
+        asIDBVariable::Ptr ptr = std::make_shared<asIDBVariable>(dbg);
+        ptr->ptr = ptr;
+        return *variables.emplace(ptr).first;
     }
 };
 
 struct asIDBBreakpoint
 {
-private:
-    asIDBBreakpoint() = default;
-
-public:
-    std::variant<asIDBBreakpointLocation, std::string>  location;
-
-    static asIDBBreakpoint Function(std::string_view f)
-    {
-        asIDBBreakpoint bp;
-        bp.location = std::string(f);
-        return bp;
-    }
-
-    static asIDBBreakpoint FileLocation(asIDBBreakpointLocation loc)
-    {
-        asIDBBreakpoint bp;
-        bp.location = loc;
-        return bp;
-    }
-
-    constexpr bool operator==(const asIDBBreakpoint &k) const
-    {
-        return location == k.location;
-    }
+    int                line;
+    std::optional<int> column;
 };
 
-template<>
-struct std::hash<asIDBBreakpoint>
-{
-    inline std::size_t operator()(const asIDBBreakpoint &key) const
-    {
-        std::size_t h = std::hash<uint8_t>()(key.location.index() == 0 ? 0x40000000 : 0x00000000);
-        if (key.location.index() == 0)
-            asIDBHashCombine(h, std::get<0>(key.location));
-        else
-            asIDBHashCombine(h, std::get<1>(key.location));
-        return h;
-    }
-};
+using asIDBSectionBreakpoints = std::vector<asIDBBreakpoint>;
+
+// TODO: class/namespace specifier
+using asIDBSectionFunctionBreakpoints = std::unordered_set<std::string>;
 
 enum class asIDBAction : uint8_t
 {
     None,
     StepInto,
     StepOver,
-    StepOut
+    StepOut,
+    Continue
+};
+    
+struct asIDBLineCol
+{
+    int line, col;
+
+    constexpr bool operator<(const asIDBLineCol &o) const { return line == o.line ? col < o.col : line < o.line; }
 };
 
-// map of script source path -> canonical name.
-using asIDBSectionSet = std::map<std::string_view, std::string_view>;
+using asIDBSectionSet = std::set<std::string, std::less<>>;
+using asIDBEngineSet = std::unordered_set<asIScriptEngine *>;
+using asIDBPotentialBreakpointMap = std::unordered_map<std::string_view, std::set<asIDBLineCol, std::less<>>>;
+
+// The workspace is contains information about the
+// "project" that the debugger is operating within.
+// This should be set, otherwise file comparisons
+// and such may not work. File paths are always
+// stored relatively, because debuggers have different
+// ideas on file paths.
+struct asIDBWorkspace
+{
+    // base path for the workspace
+    std::string     base_path;
+
+    // sections that this workspace is working with
+    asIDBSectionSet sections;
+
+    // list of engines that can be hooked.
+    asIDBEngineSet engines;
+
+    // map of breakpoint positions
+    asIDBPotentialBreakpointMap potential_breakpoints;
+
+    asIDBWorkspace(std::string_view base_path, std::initializer_list<asIScriptEngine *> engines) :
+        base_path(base_path)
+    {
+        for (auto &engine : engines)
+            if (engine)
+                this->engines.insert(engine);
+
+        CompileScriptSources();
+        CompileBreakpointPositions();
+    }
+
+    virtual void AddSection(std::string_view section)
+    {
+        if (auto it = sections.find(section); it == sections.end())
+            sections.insert(std::string(section));
+    }
+
+    virtual std::string PathToSection(const std::string_view v) const
+    {
+        return std::filesystem::relative(v, base_path).generic_string();
+    }
+
+    virtual std::string SectionToPath(const std::string_view v) const
+    {
+        return (base_path + '/').append(v);
+    }
+
+    void CompileScriptSources();
+    void CompileBreakpointPositions();
+};
+
+using asIDBBreakpointMap = std::unordered_map<std::string_view, asIDBSectionBreakpoints>;
 
 // This is the main class for interfacing with
 // the debugger. This manages the debugger thread
@@ -578,6 +859,9 @@ using asIDBSectionSet = std::map<std::string_view, std::string_view>;
 /*abstract*/ class asIDBDebugger
 {
 public:
+    // mutex for shared state, like the cache and breakpoints.
+    std::recursive_mutex mutex;
+
     // next action to perform
     asIDBAction action = asIDBAction::None;
     asUINT stack_size = 0; // for certain actions (like Step Over) we have to know
@@ -587,14 +871,14 @@ public:
     // (used to prevent infinite loops)
     std::atomic_bool internal_execution = false;
 
-    // mutex for shared state, like the cache and breakpoints.
-    std::recursive_mutex mutex;
+    // workspace
+    asIDBWorkspace *workspace;
     
     // active breakpoints
-    std::unordered_set<asIDBBreakpoint> breakpoints;
+    asIDBBreakpointMap breakpoints;
 
-    // cached sections
-    asIDBSectionSet sections;
+    // active function breakpoints
+    asIDBSectionFunctionBreakpoints function_breakpoints;
 
     // cache for the current active broken state.
     // the cache is only kept for the duration of
@@ -602,7 +886,14 @@ public:
     // the cache.
     std::unique_ptr<asIDBCache> cache;
 
-    asIDBDebugger() { }
+    // current frame offset for use by the cache
+    std::atomic_int64_t frame_offset = 0;
+
+    asIDBDebugger(asIDBWorkspace *workspace) :
+        workspace(workspace)
+    {
+    }
+
     virtual ~asIDBDebugger() { }
 
     // hooks the context onto the debugger; this will
@@ -624,31 +915,18 @@ public:
     // if this returns false. If it returns true,
     // a context still has a linecallback set
     // using this debugger.
-    bool HasWork();
+    virtual bool HasWork();
 
     // debugger operations; these set the next breakpoint,
     // clear the cache context and call Resume.
-    void StepInto();
-    void StepOver();
-    void StepOut();
-    void Continue();
+    virtual void SetAction(asIDBAction new_action);
 
     // breakpoint stuff
     bool ToggleBreakpoint(std::string_view section, int line);
-    
-    // add script sections; note that this must be done entirely
-    // by an overridden class, and you'll have to keep track of
-    // this data yourself, because AS doesn't currently provide
-    // a way to know where all script sections used are from.
-    // If this is not implemented, it simply registers all of
-    // the sections it can find with functions.
-    virtual void CacheSections(asIScriptModule *module);
-
-    // adds to cache.
-    virtual void EnsureSectionCached(std::string_view section, std::string_view canonical);
 
     // get the source code for the given section
     // of the given module.
+    // FIXME: can we move this to cache?
     virtual std::string FetchSource(const char *section) = 0;
 
 protected:
@@ -665,3 +943,9 @@ protected:
 
     static void LineCallback(asIScriptContext *ctx, asIDBDebugger *debugger);
 };
+
+template<typename T>
+/*virtual*/ void asIDBPrimitiveTypeEvaluator<T>::Evaluate(asIDBVariable::Ptr var) const /*override*/
+{
+    var->value = fmt::format("{}", *var->address.ResolveAs<const T>());
+}
