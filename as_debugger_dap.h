@@ -1,11 +1,12 @@
+// MIT Licensed
+// see https://github.com/Paril/angelscript-debugger
+
 #pragma once
 
-#include <dap/protocol.h>
 #include <dap/io.h>
 #include <dap/network.h>
-#include <dap/session.h>
+#include <dap/protocol.h>
 
-#include <vector>
 #include <memory>
 
 class asIDBDebugger;
@@ -27,8 +28,14 @@ public:
     virtual ~asIDBDAPServer();
 
     // queries
-    bool ServerActive() { return server.get() != nullptr; }
-    bool ClientConnected() { return ServerActive() && client.get() != nullptr; }
+    bool ServerActive()
+    {
+        return server.get() != nullptr;
+    }
+    bool ClientConnected()
+    {
+        return ServerActive() && client.get() != nullptr;
+    }
 
     // server management
     void StartServer();
@@ -37,8 +44,8 @@ public:
 
     // client management
 
-    template <typename T>
-    void SendEventToClient(const T& event)
+    template<typename T>
+    void SendEventToClient(const T &event)
     {
         const dap::TypeInfo *typeinfo = dap::TypeOf<T>::type();
         SendEventToClient(typeinfo, &event);

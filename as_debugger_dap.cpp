@@ -1,13 +1,15 @@
 // MIT Licensed
 // see https://github.com/Paril/angelscript-ui-debugger
 
-#include "as_debugger.h"
 #include "as_debugger_dap.h"
+#include "as_debugger.h"
+#include <dap/session.h>
+#include <filesystem>
 
 class asIDBDAPClient
 {
 public:
-    asIDBDebugger                 *dbg;
+    asIDBDebugger                *dbg;
     std::atomic_bool              configuration_complete = false;
     std::atomic_bool              terminate = false;
     std::unique_ptr<dap::Session> session;
@@ -21,33 +23,80 @@ public:
 
         session->registerHandler([&](const dap::InitializeRequest &request) {
             dap::InitializeResponse response;
-            //response.supportsCompletionsRequest = true;
             response.supportsClipboardContext = true;
             response.supportsConfigurationDoneRequest = true;
             response.supportsDelayedStackTraceLoading = true;
             response.supportsEvaluateForHovers = true;
             response.supportsFunctionBreakpoints = true;
             response.supportsBreakpointLocationsRequest = true;
+            response.supportsLoadedSourcesRequest = true;
             return response;
         });
 
         session->registerHandler([&](const dap::DisconnectRequest &request) { return this->HandleRequest(request); });
-        session->registerHandler([&](const dap::SetBreakpointsRequest &request) { return this->HandleRequest(request); });
-        session->registerHandler([&](const dap::SetFunctionBreakpointsRequest &request) { return this->HandleRequest(request); });
-        session->registerHandler([&](const dap::ConfigurationDoneRequest &request) { return this->HandleRequest(request); });
+        session->registerHandler(
+            [&](const dap::SetBreakpointsRequest &request) { return this->HandleRequest(request); });
+        session->registerHandler(
+            [&](const dap::SetFunctionBreakpointsRequest &request) { return this->HandleRequest(request); });
+        session->registerHandler(
+            [&](const dap::ConfigurationDoneRequest &request) { return this->HandleRequest(request); });
         session->registerHandler([&](const dap::ThreadsRequest &request) { return this->HandleRequest(request); });
         session->registerHandler([&](const dap::StackTraceRequest &request) { return this->HandleRequest(request); });
         session->registerHandler([&](const dap::ScopesRequest &request) { return this->HandleRequest(request); });
         session->registerHandler([&](const dap::VariablesRequest &request) { return this->HandleRequest(request); });
+        session->registerHandler([&](const dap::PauseRequest &request) { return this->HandleRequest(request); });
         session->registerHandler([&](const dap::ContinueRequest &request) { return this->HandleRequest(request); });
         session->registerHandler([&](const dap::StepOutRequest &request) { return this->HandleRequest(request); });
         session->registerHandler([&](const dap::StepInRequest &request) { return this->HandleRequest(request); });
         session->registerHandler([&](const dap::NextRequest &request) { return this->HandleRequest(request); });
         session->registerHandler([&](const dap::EvaluateRequest &request) { return this->HandleRequest(request); });
-        session->registerHandler([&](const dap::BreakpointLocationsRequest &request) { return this->HandleRequest(request); });
-        
-        session->registerSentHandler([&](const dap::ResponseOrError<dap::InitializeResponse> &response) { OnResponseSent(response); });
-        session->registerSentHandler([&](const dap::ResponseOrError<dap::ConfigurationDoneResponse> &response) { OnResponseSent(response); });
+        session->registerHandler([&](const dap::AttachRequest &request) { return this->HandleRequest(request); });
+        session->registerHandler(
+            [&](const dap::BreakpointLocationsRequest &request) { return this->HandleRequest(request); });
+        session->registerHandler(
+            [&](const dap::LoadedSourcesRequest &response) { return this->HandleRequest(response); });
+        session->registerHandler(
+            [&](const dap::SourceRequest &response) { return this->HandleRequest(response); });
+
+        session->registerSentHandler(
+            [&](const dap::ResponseOrError<dap::InitializeResponse> &response) { OnResponseSent(response); });
+        session->registerSentHandler(
+            [&](const dap::ResponseOrError<dap::ConfigurationDoneResponse> &response) { OnResponseSent(response); });
+    }
+    
+    dap::AttachResponse HandleRequest(const dap::AttachRequest &request)
+    {
+        return dap::AttachResponse {};
+    }
+    
+    dap::LoadedSourcesResponse HandleRequest(const dap::LoadedSourcesRequest &request)
+    {
+        dap::LoadedSourcesResponse response {};
+
+        for (auto &source : dbg->workspace->sections)
+        {
+            auto &src = response.sources.emplace_back();
+            src.name = source.section;
+            src.path = dbg->workspace->SectionToPath(source.section);
+            if (dbg->workspace->SectionIsVirtual(source.section))
+                src.sourceReference = source.ref;
+        }
+
+        return response;
+    }
+    
+    dap::ResponseOrError<dap::SourceResponse> HandleRequest(const dap::SourceRequest &request)
+    {
+        dap::SourceResponse response {};
+
+        auto source_it = dbg->workspace->sections.find(std::string_view(request.source->name.value()));
+
+        if (source_it == dbg->workspace->sections.end())
+            return dap::Error("can't find source");
+
+        response.content = dbg->workspace->SectionSource(request.source->name.value());
+
+        return response;
     }
 
     dap::BreakpointLocationsResponse HandleRequest(const dap::BreakpointLocationsRequest &request)
@@ -57,16 +106,16 @@ public:
         if (request.source.name.has_value())
         {
             std::scoped_lock lock(dbg->mutex);
-            if (auto linecols = dbg->workspace->potential_breakpoints.find(request.source.name.value()); linecols != dbg->workspace->potential_breakpoints.end())
+            if (auto linecols = dbg->workspace->potential_breakpoints.find(request.source.name.value());
+                linecols != dbg->workspace->potential_breakpoints.end())
             {
                 // FIXME: STL equal_range maybe?
                 for (auto &lc : linecols->second)
                 {
                     if (lc.line < request.line)
                         continue;
-                    else if (request.endLine.has_value() ?
-                        (lc.line > request.endLine.value()) :
-                        (lc.line > request.line))
+                    else if (request.endLine.has_value() ? (lc.line > request.endLine.value())
+                                                         : (lc.line > request.line))
                         continue;
                     else if (request.column.has_value() && lc.col < request.column.value())
                         continue;
@@ -96,7 +145,8 @@ public:
     {
         dap::SetBreakpointsResponse response;
 
-        if (request.source.path) {
+        if (request.source.path)
+        {
             auto rel = dbg->workspace->PathToSection(request.source.path.value());
             auto pathstr = std::filesystem::path(rel).generic_string();
 
@@ -107,12 +157,14 @@ public:
             if (auto it = dbg->breakpoints.find(pathstr); it != dbg->breakpoints.end())
                 dbg->breakpoints.erase(it);
 
-            if (request.breakpoints && !request.breakpoints->empty()) {
+            if (request.breakpoints && !request.breakpoints->empty())
+            {
                 auto &pathstrptr = *dbg->workspace->sections.find(pathstr);
-                auto &positions = dbg->workspace->potential_breakpoints[pathstrptr];
-                auto it = dbg->breakpoints.find(pathstrptr);
+                auto &positions = dbg->workspace->potential_breakpoints[pathstrptr.section];
+                auto  it = dbg->breakpoints.find(pathstrptr.section);
 
-                for (auto &bp : *request.breakpoints) {
+                for (auto &bp : *request.breakpoints)
+                {
                     asIDBLineCol closest { -1, -1 };
 
                     // FIXME: there's probably some STL methods that can
@@ -143,7 +195,7 @@ public:
                     placed_bp.verified = true;
 
                     if (it == dbg->breakpoints.end())
-                        it = dbg->breakpoints.insert({ pathstrptr, asIDBSectionBreakpoints {} }).first;
+                        it = dbg->breakpoints.insert({ pathstrptr.section, asIDBSectionBreakpoints {} }).first;
 
                     it->second.push_back({ (int) closest.line, (int) closest.col });
                 }
@@ -155,12 +207,13 @@ public:
 
     dap::SetFunctionBreakpointsResponse HandleRequest(const dap::SetFunctionBreakpointsRequest &request)
     {
-        std::scoped_lock lock(dbg->mutex);
+        std::scoped_lock                    lock(dbg->mutex);
         dap::SetFunctionBreakpointsResponse response {};
-        
+
         dbg->function_breakpoints.clear();
 
-        for (auto &bp : request.breakpoints) {
+        for (auto &bp : request.breakpoints)
+        {
             dbg->function_breakpoints.insert(bp.name);
 
             dap::Breakpoint bp {};
@@ -180,15 +233,13 @@ public:
     dap::ThreadsResponse HandleRequest(const dap::ThreadsRequest &request)
     {
         dap::ThreadsResponse response {};
-        response.threads.push_back({
-            1, "Main"
-        });
+        response.threads.push_back({ 1, "Main" });
         return response;
     }
 
     dap::StackTraceResponse HandleRequest(const dap::StackTraceRequest &request)
     {
-        std::scoped_lock lock(dbg->mutex);
+        std::scoped_lock        lock(dbg->mutex);
         dap::StackTraceResponse response {};
 
         if (!dbg->cache || !dbg->cache->ctx)
@@ -203,11 +254,12 @@ public:
 
         dbg->cache->CacheCallstack();
 
-        int64_t start = request.startFrame.has_value() ? (int64_t)(*request.startFrame) : (int64_t)0;
-        int64_t levels = (request.levels.has_value() && request.levels.value() > 0) ? (int64_t)(*request.levels) : (int64_t) 9999;
+        int64_t start = request.startFrame.has_value() ? (int64_t) (*request.startFrame) : (int64_t) 0;
+        int64_t levels =
+            (request.levels.has_value() && request.levels.value() > 0) ? (int64_t) (*request.levels) : (int64_t) 9999;
 
         response.totalFrames = dbg->cache->call_stack.size();
-                
+
         for (asUINT i = 0; i < levels && (size_t) (i + start) < dbg->cache->call_stack.size(); i++)
         {
             auto &frame = response.stackFrames.emplace_back();
@@ -248,29 +300,35 @@ public:
             if (stack.id != request.frameId)
                 continue;
 
-            if (!stack.scope.locals->Children().empty())
+            if (!stack.scope.locals->namedProps.empty() ||
+                !stack.scope.locals->indexedProps.empty())
             {
                 auto &scope = response.scopes.emplace_back();
                 scope.name = "Locals";
                 scope.presentationHint = "locals";
-                scope.namedVariables = stack.scope.locals->Children().size();
-                scope.variablesReference = stack.scope.locals->RefId();
+                scope.namedVariables = stack.scope.locals->namedProps.size();
+                scope.indexedVariables = stack.scope.locals->indexedProps.size();
+                scope.variablesReference = stack.scope.locals->expandRefId.value();
             }
-            if (!stack.scope.parameters->Children().empty())
+            if (!stack.scope.parameters->namedProps.empty() ||
+                !stack.scope.parameters->indexedProps.empty())
             {
                 auto &scope = response.scopes.emplace_back();
                 scope.name = "Parameters";
                 scope.presentationHint = "parameters";
-                scope.namedVariables = stack.scope.parameters->Children().size();
-                scope.variablesReference = stack.scope.parameters->RefId();
+                scope.namedVariables = stack.scope.parameters->namedProps.size();
+                scope.indexedVariables = stack.scope.locals->indexedProps.size();
+                scope.variablesReference = stack.scope.parameters->expandRefId.value();
             }
-            if (!stack.scope.registers->Children().empty())
+            if (!stack.scope.registers->namedProps.empty() ||
+                !stack.scope.registers->indexedProps.empty())
             {
                 auto &scope = response.scopes.emplace_back();
                 scope.name = "Registers";
                 scope.presentationHint = "registers";
-                scope.namedVariables = stack.scope.registers->Children().size();
-                scope.variablesReference = stack.scope.registers->RefId();
+                scope.namedVariables = stack.scope.registers->namedProps.size();
+                scope.indexedVariables = stack.scope.locals->indexedProps.size();
+                scope.variablesReference = stack.scope.registers->expandRefId.value();
             }
             found = true;
             break;
@@ -279,14 +337,16 @@ public:
         if (!found)
             return dap::Error { "invalid stack ID" };
 
-        if (!dbg->cache->globals->Children().empty())
+        if (!dbg->cache->globals->namedProps.empty() ||
+            !dbg->cache->globals->indexedProps.empty())
         {
             auto &scope = response.scopes.emplace_back();
             scope.name = "Globals";
             scope.presentationHint = "globals";
-            scope.namedVariables = dbg->cache->globals->Children().size();
+            scope.namedVariables = dbg->cache->globals->namedProps.size();
+            scope.indexedVariables = dbg->cache->globals->indexedProps.size();
+            scope.variablesReference = dbg->cache->globals->expandRefId.value();
             scope.expensive = true;
-            scope.variablesReference = dbg->cache->globals->RefId();
         }
 
         return response;
@@ -295,28 +355,20 @@ public:
     dap::ResponseOrError<dap::VariablesResponse> HandleRequest(const dap::VariablesRequest &request)
     {
         std::scoped_lock lock(dbg->mutex);
-        auto varit = dbg->cache->variable_refs.find(request.variablesReference);
+        auto             varit = dbg->cache->variable_refs.find(request.variablesReference);
 
         if (varit == dbg->cache->variable_refs.end())
             return dap::Error("invalid variablesReference");
 
-        auto varContainer = varit->second.lock();
+        auto                   varContainer = varit->second.lock();
         dap::VariablesResponse response {};
 
         varContainer->Evaluate();
         varContainer->Expand();
-
-        int64_t start = request.start.has_value() ? (int64_t) request.start.value() : 0;
-        int64_t count = request.count.has_value() ? (int64_t) request.count.value() : varContainer->Children().size();
-
-        auto it = varContainer->Children().begin();
-        std::advance(it, start);
-
-        for (int64_t i = start; i < count; i++)
+        
+        auto emplace_var = [&](const asIDBVariable::Ptr &local)
         {
-            auto &local = *it;
             auto &var = response.variables.emplace_back();
-
             local->Evaluate();
             var.name = local->identifier.Combine();
             var.type = dap::string(local->typeName);
@@ -331,12 +383,31 @@ public:
             {
                 var.value = local->value.empty() ? local->typeName : local->value;
             }
-            var.namedVariables = local->Children().size();
-            var.variablesReference = local->RefId();
-            it++;
+            var.namedVariables = local->namedProps.size();
+            var.indexedVariables = local->indexedProps.size();
+            var.variablesReference = local->expandRefId.value_or(0);
+        };
+
+        if (!request.filter.has_value() || request.filter.value() == "named")
+            for (auto &var : varContainer->namedProps)
+                emplace_var(var);
+        
+        if (!request.filter.has_value() || request.filter.value() == "indexed")
+        {
+            int64_t start = request.start.has_value() ? (int64_t) request.start.value() : 0;
+            int64_t count = request.count.has_value() ? (int64_t) request.count.value() : varContainer->indexedProps.size();
+
+            for (int64_t i = start; i < count; i++)
+                emplace_var(varContainer->indexedProps[i]);
         }
 
         return response;
+    }
+
+    dap::PauseResponse HandleRequest(const dap::PauseRequest &request)
+    {
+        dbg->SetAction(asIDBAction::Pause);
+        return {};
     }
 
     dap::ContinueResponse HandleRequest(const dap::ContinueRequest &request)
@@ -365,7 +436,7 @@ public:
 
     dap::ResponseOrError<dap::EvaluateResponse> HandleRequest(const dap::EvaluateRequest &request)
     {
-        std::scoped_lock lock(dbg->mutex);
+        std::scoped_lock      lock(dbg->mutex);
         dap::EvaluateResponse response {};
 
         if (!dbg->cache)
@@ -391,10 +462,10 @@ public:
         auto var = result.value().lock();
 
         var->Evaluate();
-        
+
         response.type = dap::string(var->typeName);
         response.result = var->value.empty() ? var->typeName : var->value;
-        response.variablesReference = var->RefId();
+        response.variablesReference = var->expandRefId.value_or(0);
 
         return response;
     }
@@ -410,11 +481,6 @@ public:
 
     void OnResponseSent(const dap::ResponseOrError<dap::ConfigurationDoneResponse> &response)
     {
-        dap::ThreadEvent threadStartedEvent;
-        threadStartedEvent.reason = "started";
-        threadStartedEvent.threadId = 1;
-        session->send(threadStartedEvent);
-
         configuration_complete = true;
     }
 };
@@ -443,10 +509,9 @@ void asIDBDAPServer::StartServer()
 {
     server = dap::net::Server::create();
 
-    server->start(port,
-        [&](const std::shared_ptr<dap::ReaderWriter> &socket) { this->ClientConnected(socket); },
-        [&](const char *msg) { this->ClientError(msg); }
-    );
+    server->start(
+        port, [&](const std::shared_ptr<dap::ReaderWriter> &socket) { this->ClientConnected(socket); },
+        [&](const char *msg) { this->ClientError(msg); });
 }
 
 void asIDBDAPServer::StopServer()
