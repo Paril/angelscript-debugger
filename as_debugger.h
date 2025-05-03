@@ -65,13 +65,27 @@ struct asIDBVarAddr
     asIDBVarAddr(const asIDBVarAddr &) = default;
 
     template<typename T>
-    T *ResolveAs() const
+    T *ResolveAs(bool reference = false) const
     {
         if (!address)
             return nullptr;
         else if (typeId & (asTYPEID_HANDLETOCONST | asTYPEID_OBJHANDLE))
+        {
+            if (reference)
+                return reinterpret_cast<T *>(address);
             return *reinterpret_cast<T **>(address);
+        }
         return reinterpret_cast<T *>(address);
+    }
+
+    size_t GetSize(asIScriptEngine *engine) const
+    {
+        if (typeId == 0)
+            return 0;
+        else if (auto type = engine->GetTypeInfoById(typeId))
+            return type->GetSize();
+        else
+            return engine->GetSizeOfPrimitiveType(typeId);
     }
 };
 
@@ -594,7 +608,7 @@ public:
     // HasWork() returns true and you're requesting
     // a new context / executing code from a context
     // that isn't already hooked.
-    void HookContext(asIScriptContext *ctx);
+    void HookContext(asIScriptContext *ctx, bool has_work);
 
     // break on the current context. Creates the cache
     // and then suspends. Note that the cache will
@@ -632,8 +646,9 @@ protected:
 
     // create a cache for the given context.
     virtual std::unique_ptr<asIDBCache> CreateCache(asIScriptContext *ctx) = 0;
-
+    
     static void LineCallback(asIScriptContext *ctx, asIDBDebugger *debugger);
+    static void ExceptionCallback(asIScriptContext *ctx, asIDBDebugger *debugger);
 };
 
 template<typename T>

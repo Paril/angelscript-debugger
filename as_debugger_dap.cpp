@@ -5,6 +5,7 @@
 #include "as_debugger.h"
 #include <dap/session.h>
 #include <filesystem>
+#include <charconv>
 
 class asIDBDAPClient
 {
@@ -30,6 +31,8 @@ public:
             response.supportsFunctionBreakpoints = true;
             response.supportsBreakpointLocationsRequest = true;
             response.supportsLoadedSourcesRequest = true;
+            response.supportsReadMemoryRequest = true;
+            response.supportsExceptionInfoRequest = true;
             return response;
         });
 
@@ -57,11 +60,61 @@ public:
             [&](const dap::LoadedSourcesRequest &response) { return this->HandleRequest(response); });
         session->registerHandler(
             [&](const dap::SourceRequest &response) { return this->HandleRequest(response); });
+        session->registerHandler(
+            [&](const dap::ReadMemoryRequest &response) { return this->HandleRequest(response); });
+        session->registerHandler(
+            [&](const dap::ExceptionInfoRequest &response) { return this->HandleRequest(response); });
 
         session->registerSentHandler(
             [&](const dap::ResponseOrError<dap::InitializeResponse> &response) { OnResponseSent(response); });
         session->registerSentHandler(
             [&](const dap::ResponseOrError<dap::ConfigurationDoneResponse> &response) { OnResponseSent(response); });
+    }
+    
+    dap::ReadMemoryResponse HandleRequest(const dap::ReadMemoryRequest &request)
+    {
+        dap::ReadMemoryResponse response {};
+
+        uintptr_t ptr;
+        std::from_chars(request.memoryReference.c_str(), request.memoryReference.c_str() + request.memoryReference.size(), ptr);
+
+        asIDBVariable *var = reinterpret_cast<asIDBVariable *>(ptr);
+
+        uint8_t *data = var->address.ResolveAs<uint8_t>();
+        // FIXME: engine?
+        size_t size = var->address.GetSize(dbg->cache->ctx->GetEngine());
+        uint8_t *data_end = data + size;
+
+        int64_t offset = request.offset.has_value() ? (int64_t) request.offset.value() : 0;
+        int64_t count = request.count;
+
+        data += offset;
+
+        uint8_t *end = std::min(data_end, data + count);
+
+        if (!count || !(end - data) || data >= end)
+            return response;
+
+        std::string buf((intptr_t) (end - data), '\0');
+        memcpy(buf.data(), data, buf.size());
+        response.address = fmt::format("{}", reinterpret_cast<uintptr_t>(data));
+        response.data = base64::to_base64(buf);
+
+        return response;
+    }
+    
+    dap::ExceptionInfoResponse HandleRequest(const dap::ExceptionInfoRequest &request)
+    {
+        dap::ExceptionInfoResponse response {};
+
+        response.breakMode = "always";
+        response.description = dbg->cache->ctx->GetExceptionString();
+        dap::ExceptionDetails details {};
+        details.message = dbg->cache->ctx->GetExceptionString();
+        response.details = details;
+        response.exceptionId = "exception";
+
+        return response;
     }
     
     dap::AttachResponse HandleRequest(const dap::AttachRequest &request)
@@ -386,6 +439,7 @@ public:
             var.namedVariables = local->namedProps.size();
             var.indexedVariables = local->indexedProps.size();
             var.variablesReference = local->expandRefId.value_or(0);
+            var.memoryReference = fmt::format("{}", reinterpret_cast<uintptr_t>(local->ptr.lock().get()));
         };
 
         if (!request.filter.has_value() || request.filter.value() == "named")

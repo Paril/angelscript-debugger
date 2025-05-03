@@ -167,6 +167,16 @@ public:
         return reinterpret_cast<T *>(const_cast<asQWORD *>(&value.u64));
     }
 
+    size_t GetSize() const
+    {
+        if (typeId == 0)
+            return 0;
+        else if (type)
+            return type->GetSize();
+        else
+            return engine->GetSizeOfPrimitiveType(typeId);
+    }
+
     void SetArgument(asIScriptContext *ctx, asUINT index) const;
 };
 
@@ -395,3 +405,190 @@ struct asIDBNatLess
 };
 
 using asIDBNatILess = asIDBNatLess<false>;
+
+/*
+MIT License
+
+Copyright (c) 2019 Tobias Locker
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+https://github.com/tobiaslocker/base64
+*/
+
+#include <algorithm>
+#include <array>
+#include <cassert>
+#include <cstdint>
+#include <cstring>
+#include <stdexcept>
+#include <string>
+#include <string_view>
+#include <type_traits>
+
+namespace base64 {
+
+namespace detail {
+
+inline constexpr char padding_char{'='};
+
+#if !defined(__LITTLE_ENDIAN__) && !defined(__BIG_ENDIAN__)
+#if (defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__) ||  \
+    (defined(__BYTE_ORDER) && __BYTE_ORDER == __BIG_ENDIAN) ||              \
+    (defined(_BYTE_ORDER) && _BYTE_ORDER == _BIG_ENDIAN) ||                 \
+    (defined(BYTE_ORDER) && BYTE_ORDER == BIG_ENDIAN) ||                    \
+    (defined(__sun) && defined(__SVR4) && defined(_BIG_ENDIAN)) ||          \
+    defined(__ARMEB__) || defined(__THUMBEB__) || defined(__AARCH64EB__) || \
+    defined(_MIBSEB) || defined(__MIBSEB) || defined(__MIBSEB__) ||         \
+    defined(_M_PPC)
+#define __BIG_ENDIAN__
+#elif (defined(__BYTE_ORDER__) &&                                              \
+       __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__) || /* gcc */                 \
+    (defined(__BYTE_ORDER) &&                                                  \
+     __BYTE_ORDER == __LITTLE_ENDIAN) /* linux header */                       \
+    || (defined(_BYTE_ORDER) && _BYTE_ORDER == _LITTLE_ENDIAN) ||              \
+    (defined(BYTE_ORDER) && BYTE_ORDER == LITTLE_ENDIAN) /* mingw header */ || \
+    (defined(__sun) && defined(__SVR4) &&                                      \
+     defined(_LITTLE_ENDIAN)) || /* solaris */                                 \
+    defined(__ARMEL__) ||                                                      \
+    defined(__THUMBEL__) || defined(__AARCH64EL__) || defined(_MIPSEL) ||      \
+    defined(__MIPSEL) || defined(__MIPSEL__) || defined(_M_IX86) ||            \
+    defined(_M_X64) || defined(_M_IA64) || /* msvc for intel processors */     \
+    defined(_M_ARM) /* msvc code on arm executes in little endian mode */
+#define __LITTLE_ENDIAN__
+#endif
+#endif
+
+#if !defined(__LITTLE_ENDIAN__) & !defined(__BIG_ENDIAN__)
+#error "UNKNOWN Platform / endianness. Configure endianness explicitly."
+#endif
+
+std::array<char, 256> constexpr encode_table_0 = {
+    'A', 'A', 'A', 'A', 'B', 'B', 'B', 'B', 'C', 'C', 'C', 'C', 'D', 'D', 'D',
+    'D', 'E', 'E', 'E', 'E', 'F', 'F', 'F', 'F', 'G', 'G', 'G', 'G', 'H', 'H',
+    'H', 'H', 'I', 'I', 'I', 'I', 'J', 'J', 'J', 'J', 'K', 'K', 'K', 'K', 'L',
+    'L', 'L', 'L', 'M', 'M', 'M', 'M', 'N', 'N', 'N', 'N', 'O', 'O', 'O', 'O',
+    'P', 'P', 'P', 'P', 'Q', 'Q', 'Q', 'Q', 'R', 'R', 'R', 'R', 'S', 'S', 'S',
+    'S', 'T', 'T', 'T', 'T', 'U', 'U', 'U', 'U', 'V', 'V', 'V', 'V', 'W', 'W',
+    'W', 'W', 'X', 'X', 'X', 'X', 'Y', 'Y', 'Y', 'Y', 'Z', 'Z', 'Z', 'Z', 'a',
+    'a', 'a', 'a', 'b', 'b', 'b', 'b', 'c', 'c', 'c', 'c', 'd', 'd', 'd', 'd',
+    'e', 'e', 'e', 'e', 'f', 'f', 'f', 'f', 'g', 'g', 'g', 'g', 'h', 'h', 'h',
+    'h', 'i', 'i', 'i', 'i', 'j', 'j', 'j', 'j', 'k', 'k', 'k', 'k', 'l', 'l',
+    'l', 'l', 'm', 'm', 'm', 'm', 'n', 'n', 'n', 'n', 'o', 'o', 'o', 'o', 'p',
+    'p', 'p', 'p', 'q', 'q', 'q', 'q', 'r', 'r', 'r', 'r', 's', 's', 's', 's',
+    't', 't', 't', 't', 'u', 'u', 'u', 'u', 'v', 'v', 'v', 'v', 'w', 'w', 'w',
+    'w', 'x', 'x', 'x', 'x', 'y', 'y', 'y', 'y', 'z', 'z', 'z', 'z', '0', '0',
+    '0', '0', '1', '1', '1', '1', '2', '2', '2', '2', '3', '3', '3', '3', '4',
+    '4', '4', '4', '5', '5', '5', '5', '6', '6', '6', '6', '7', '7', '7', '7',
+    '8', '8', '8', '8', '9', '9', '9', '9', '+', '+', '+', '+', '/', '/', '/',
+    '/'};
+
+std::array<char, 256> constexpr encode_table_1 = {
+    'A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J', 'K', 'L', 'M', 'N', 'O',
+    'P', 'Q', 'R', 'S', 'T', 'U', 'V', 'W', 'X', 'Y', 'Z', 'a', 'b', 'c', 'd',
+    'e', 'f', 'g', 'h', 'i', 'j', 'k', 'l', 'm', 'n', 'o', 'p', 'q', 'r', 's',
+    't', 'u', 'v', 'w', 'x', 'y', 'z', '0', '1', '2', '3', '4', '5', '6', '7',
+    '8', '9', '+', '/', 'A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J', 'K',
+    'L', 'M', 'N', 'O', 'P', 'Q', 'R', 'S', 'T', 'U', 'V', 'W', 'X', 'Y', 'Z',
+    'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i', 'j', 'k', 'l', 'm', 'n', 'o',
+    'p', 'q', 'r', 's', 't', 'u', 'v', 'w', 'x', 'y', 'z', '0', '1', '2', '3',
+    '4', '5', '6', '7', '8', '9', '+', '/', 'A', 'B', 'C', 'D', 'E', 'F', 'G',
+    'H', 'I', 'J', 'K', 'L', 'M', 'N', 'O', 'P', 'Q', 'R', 'S', 'T', 'U', 'V',
+    'W', 'X', 'Y', 'Z', 'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i', 'j', 'k',
+    'l', 'm', 'n', 'o', 'p', 'q', 'r', 's', 't', 'u', 'v', 'w', 'x', 'y', 'z',
+    '0', '1', '2', '3', '4', '5', '6', '7', '8', '9', '+', '/', 'A', 'B', 'C',
+    'D', 'E', 'F', 'G', 'H', 'I', 'J', 'K', 'L', 'M', 'N', 'O', 'P', 'Q', 'R',
+    'S', 'T', 'U', 'V', 'W', 'X', 'Y', 'Z', 'a', 'b', 'c', 'd', 'e', 'f', 'g',
+    'h', 'i', 'j', 'k', 'l', 'm', 'n', 'o', 'p', 'q', 'r', 's', 't', 'u', 'v',
+    'w', 'x', 'y', 'z', '0', '1', '2', '3', '4', '5', '6', '7', '8', '9', '+',
+    '/'};
+
+}  // namespace detail
+
+template <class OutputBuffer, class InputIterator>
+inline OutputBuffer encode_into(InputIterator begin, InputIterator end) {
+  typedef std::decay_t<decltype(*begin)> input_value_type;
+  static_assert(std::is_same_v<input_value_type, char> ||
+                std::is_same_v<input_value_type, signed char> ||
+                std::is_same_v<input_value_type, unsigned char> ||
+                std::is_same_v<input_value_type, std::byte>);
+  typedef typename OutputBuffer::value_type output_value_type;
+  static_assert(std::is_same_v<output_value_type, char> ||
+                std::is_same_v<output_value_type, signed char> ||
+                std::is_same_v<output_value_type, unsigned char> ||
+                std::is_same_v<output_value_type, std::byte>);
+  const size_t binarytextsize = end - begin;
+  const size_t encodedsize = (binarytextsize / 3 + (binarytextsize % 3 > 0))
+                             << 2;
+  OutputBuffer encoded(encodedsize, detail::padding_char);
+
+  const uint8_t* bytes = reinterpret_cast<const uint8_t*>(&*begin);
+  char* currEncoding = reinterpret_cast<char*>(&encoded[0]);
+
+  for (size_t i = binarytextsize / 3; i; --i) {
+    const uint8_t t1 = *bytes++;
+    const uint8_t t2 = *bytes++;
+    const uint8_t t3 = *bytes++;
+    *currEncoding++ = detail::encode_table_0[t1];
+    *currEncoding++ =
+        detail::encode_table_1[((t1 & 0x03) << 4) | ((t2 >> 4) & 0x0F)];
+    *currEncoding++ =
+        detail::encode_table_1[((t2 & 0x0F) << 2) | ((t3 >> 6) & 0x03)];
+    *currEncoding++ = detail::encode_table_1[t3];
+  }
+
+  switch (binarytextsize % 3) {
+    case 0: {
+      break;
+    }
+    case 1: {
+      const uint8_t t1 = bytes[0];
+      *currEncoding++ = detail::encode_table_0[t1];
+      *currEncoding++ = detail::encode_table_1[(t1 & 0x03) << 4];
+      // *currEncoding++ = detail::padding_char;
+      // *currEncoding++ = detail::padding_char;
+      break;
+    }
+    case 2: {
+      const uint8_t t1 = bytes[0];
+      const uint8_t t2 = bytes[1];
+      *currEncoding++ = detail::encode_table_0[t1];
+      *currEncoding++ =
+          detail::encode_table_1[((t1 & 0x03) << 4) | ((t2 >> 4) & 0x0F)];
+      *currEncoding++ = detail::encode_table_1[(t2 & 0x0F) << 2];
+      // *currEncoding++ = detail::padding_char;
+      break;
+    }
+    default: {
+      throw std::runtime_error{"Invalid base64 encoded data"};
+    }
+  }
+
+  return encoded;
+}
+
+template <class OutputBuffer>
+inline OutputBuffer encode_into(std::string_view data) {
+  return encode_into<OutputBuffer>(std::begin(data), std::end(data));
+}
+
+inline std::string to_base64(std::string_view data) {
+  return encode_into<std::string>(std::begin(data), std::end(data));
+}
+}
