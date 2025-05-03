@@ -112,7 +112,7 @@ public:
 ```
 
 # Quick DAP support table
-  - [ ] Attach
+  - [x] Attach
   - [x] BreakpointLocations
   - [ ] Completions
   - [x] ConfigurationDone
@@ -126,11 +126,11 @@ public:
   - [ ] GotoTargets
   - [x] Initialize
   - [ ] Launch
-  - [ ] LoadedSources
+  - [x] LoadedSources
   - [ ] Locations
   - [ ] Modules
   - [x] Next
-  - [ ] Pause
+  - [x] Pause
   - [ ] ReadMemory
   - [ ] Restart
   - [ ] RestartFrame
@@ -143,7 +143,7 @@ public:
   - [x] SetFunctionBreakpoints
   - [ ] SetInstructionBreakpoints
   - [ ] SetVariable
-  - [ ] Source
+  - [x] Source
   - [x] StackTrace
   - [ ] StepBack
   - [x] StepIn
@@ -160,6 +160,7 @@ public:
   - [x] supportsEvaluateForHovers
   - [x] supportsFunctionBreakpoints
   - [x] supportsBreakpointLocationsRequest
+  - [x] supportsLoadedSourcesRequest
   
 # TODO / coming soon
 * mostly cleanup and breakpoint rejiggering
